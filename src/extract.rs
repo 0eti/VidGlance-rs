@@ -8,8 +8,10 @@ use ffmpeg::software::scaling;
 use ffmpeg::util::format::Pixel;
 use ffmpeg_next as ffmpeg;
 use image::RgbImage;
-#[cfg(test)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// 여는 데 이보다 오래 걸린 파일(색인 없는 fragmented MP4 등)은 다시 열지 않고 칸을 혼자 뽑는다.
+const REOPEN_LIMIT_SECONDS: f64 = 0.1;
 
 /// 칸 사이 최소 간격(초). 이보다 촘촘하면 "매우 짧은 영상"으로 본다.
 pub const MIN_SPACING: f64 = 0.1;
@@ -65,6 +67,16 @@ pub fn plan_times(duration: f64, count: usize, skip_start: f64, skip_end: f64) -
     FramePlan { times, warnings }
 }
 
+/// probe::open이 연 파일. 칸을 나눠 뽑을 때 다른 스레드는 path를 다시 연다.
+pub struct Source {
+    pub input: ffmpeg::format::context::Input,
+    pub path: PathBuf,
+    pub open_seconds: f64,
+}
+
+/// 키프레임 조회 결과: ((seek 시각, backward), (pts, 초))
+type PeekCache = ((i64, bool), Option<(i64, f64)>);
+
 /// swscale 설정 키: (원본 픽셀 형식, 원본 가로, 원본 세로, 출력 가로, 출력 세로)
 type ScalerKey = (Pixel, u32, u32, u32, u32);
 
@@ -73,55 +85,124 @@ struct Decoding {
     input: ffmpeg::format::context::Input,
     stream_index: usize,
     time_base: f64,
-    /// 정확한 시점까지 연달아 디코딩할 때: 프레임·슬라이스 스레드 (처리량 위주)
-    sequential: ffmpeg::decoder::Video,
+    parameters: ffmpeg::codec::Parameters,
+    threads: usize,
+    /// 정확한 시점까지 연달아 디코딩할 때: 프레임·슬라이스 스레드 (처리량 위주).
+    /// 처음 필요할 때 연다 (fast 모드에서 키프레임만 쓰면 열지 않는다).
+    sequential: Option<ffmpeg::decoder::Video>,
     /// 키프레임 한 장만 뽑을 때: 저지연 (패킷 하나 넣으면 바로 나옴). 프레임 스레드는
     /// 첫 프레임 전에 패킷을 여러 장 받아 디코딩하므로 한 장만 필요할 때 2배 넘게 느리다.
     single: ffmpeg::decoder::Video,
     eof_sent: bool,
+    /// sequential 디코더가 마지막으로 내놓은 프레임 시각. seek하면 None.
+    /// 다음 칸이 같은 키프레임 구간이면 seek 없이 여기서 이어 디코딩한다.
+    position: Option<f64>,
+    /// 키프레임 위치만 알아볼 때 쓰는 같은 파일의 두 번째 열기. 본 파일의 디코딩 위치를 지킨다.
+    /// reopen이 None이면(여는 데 오래 걸리는 파일) 열지 않고 본 파일에서 알아본다.
+    peeker: Option<ffmpeg::format::context::Input>,
+    reopen: Option<PathBuf>,
+    /// 마지막 키프레임 조회: ((seek 시각, backward), 결과)
+    last_peek: Option<PeekCache>,
+    /// fast 모드에서 키프레임 한 장으로 끝낸 칸 수
+    keyframe_hits: usize,
     rotation: i32,
     scaler: Option<(scaling::Context, ScalerKey)>,
 }
 
+/// 지금 위치에서 stream의 첫 패킷 시각 (pts, 없으면 dts).
+fn first_packet_pts(
+    input: &mut ffmpeg::format::context::Input,
+    stream_index: usize,
+) -> Option<i64> {
+    let mut packet = ffmpeg::Packet::empty();
+    loop {
+        packet.read(input).ok()?;
+        if packet.stream() == stream_index
+            && let Some(pts) = packet.pts().or_else(|| packet.dts())
+        {
+            return Some(pts);
+        }
+    }
+}
+
+/// stream 기준 time_base 단위 ts로 seek한다 (backward면 ts 이전 키프레임).
+fn seek_input(
+    input: &mut ffmpeg::format::context::Input,
+    stream_index: usize,
+    ts: i64,
+    backward: bool,
+) -> Result<(), ffmpeg::Error> {
+    let flags = if backward {
+        ffi::AVSEEK_FLAG_BACKWARD
+    } else {
+        0
+    };
+    let ret = unsafe { ffi::av_seek_frame(input.as_mut_ptr(), stream_index as i32, ts, flags) };
+    if ret < 0 {
+        return Err(ffmpeg::Error::from(ret));
+    }
+    Ok(())
+}
+
+// SwsContext·디코더는 스레드에 묶이지 않으므로 다른 스레드로 넘겨도 된다 (동시에 쓰지는 않음).
+unsafe impl Send for Decoding {}
+
+/// 디코더를 연다. threads가 0이면 스레드 개수 자동.
+fn open_decoder(
+    parameters: &ffmpeg::codec::Parameters,
+    threads: usize,
+    low_delay: bool,
+) -> Result<ffmpeg::decoder::Video, ffmpeg::Error> {
+    let mut ctx = ffmpeg::codec::context::Context::from_parameters(parameters.clone())?;
+    unsafe {
+        let raw = ctx.as_mut_ptr();
+        (*raw).thread_count = threads as i32;
+        if low_delay {
+            (*raw).thread_type = ffi::FF_THREAD_SLICE;
+            (*raw).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+        } else {
+            // PyAV의 thread_type = "AUTO"와 같게
+            (*raw).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
+        }
+    }
+    ctx.decoder().video()
+}
+
 impl Decoding {
-    #[cfg(test)]
-    fn open(path: &Path) -> Result<Self, ffmpeg::Error> {
+    fn open(path: &Path, threads: usize) -> Result<Self, ffmpeg::Error> {
         probe::init();
-        Self::from_input(ffmpeg::format::input(path)?)
+        Self::from_input(ffmpeg::format::input(path)?, threads, Some(path))
     }
 
     /// 이미 연 파일로 시작한다 (probe::open이 연 것을 그대로 쓴다).
-    fn from_input(input: ffmpeg::format::context::Input) -> Result<Self, ffmpeg::Error> {
+    /// reopen: 키프레임 조회용으로 다시 열어도 되는 경로.
+    fn from_input(
+        input: ffmpeg::format::context::Input,
+        threads: usize,
+        reopen: Option<&Path>,
+    ) -> Result<Self, ffmpeg::Error> {
         let stream = probe::first_video(&input).ok_or(ffmpeg::Error::StreamNotFound)?;
         let stream_index = stream.index();
         let tb = stream.time_base();
         let time_base = tb.numerator() as f64 / tb.denominator() as f64;
         let rotation =
             ((probe::stream_rotation(&stream) as f64 / 90.0).round() as i32 * 90).rem_euclid(360);
-        let open_decoder = |low_delay: bool| -> Result<ffmpeg::decoder::Video, ffmpeg::Error> {
-            let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-            unsafe {
-                let raw = ctx.as_mut_ptr();
-                (*raw).thread_count = 0; // 스레드 개수 자동
-                if low_delay {
-                    (*raw).thread_type = ffi::FF_THREAD_SLICE;
-                    (*raw).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-                } else {
-                    // PyAV의 thread_type = "AUTO"와 같게
-                    (*raw).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
-                }
-            }
-            ctx.decoder().video()
-        };
-        let sequential = open_decoder(false)?;
-        let single = open_decoder(true)?;
+        let parameters = stream.parameters();
+        let single = open_decoder(&parameters, threads, true)?;
         Ok(Decoding {
             input,
             stream_index,
             time_base,
-            sequential,
+            parameters,
+            threads,
+            sequential: None,
             single,
             eof_sent: false,
+            position: None,
+            peeker: None,
+            reopen: reopen.map(Path::to_path_buf),
+            last_peek: None,
+            keyframe_hits: 0,
             rotation,
             scaler: None,
         })
@@ -145,18 +226,11 @@ impl Decoding {
 
     /// 스트림 time_base 단위 시각으로 seek한다.
     fn seek_ts(&mut self, ts: i64, backward: bool) -> Result<(), ffmpeg::Error> {
-        let flags = if backward {
-            ffi::AVSEEK_FLAG_BACKWARD
-        } else {
-            0
-        };
-        let ret = unsafe {
-            ffi::av_seek_frame(self.input.as_mut_ptr(), self.stream_index as i32, ts, flags)
-        };
-        if ret < 0 {
-            return Err(ffmpeg::Error::from(ret));
+        self.position = None;
+        seek_input(&mut self.input, self.stream_index, ts, backward)?;
+        if let Some(decoder) = self.sequential.as_mut() {
+            decoder.flush();
         }
-        self.sequential.flush();
         self.single.flush();
         self.eof_sent = false;
         Ok(())
@@ -167,12 +241,14 @@ impl Decoding {
         &mut self,
         single: bool,
     ) -> Result<Option<(ffmpeg::frame::Video, f64)>, ffmpeg::Error> {
+        if !single && self.sequential.is_none() {
+            self.sequential = Some(open_decoder(&self.parameters, self.threads, false)?);
+        }
         let mut frame = ffmpeg::frame::Video::empty();
         loop {
-            let decoder = if single {
-                &mut self.single
-            } else {
-                &mut self.sequential
+            let decoder = match (single, self.sequential.as_mut()) {
+                (false, Some(sequential)) => sequential,
+                _ => &mut self.single,
             };
             match decoder.receive_frame(&mut frame) {
                 Ok(()) => {
@@ -207,51 +283,83 @@ impl Decoding {
     }
 
     /// target 이전 키프레임부터 디코딩해 target 이상인 첫 프레임 (ffmpeg 입력 seek과 같음).
+    ///
+    /// 직전 칸에서 디코딩한 위치와 target 사이에 키프레임이 없으면 seek하지 않고 이어서
+    /// 디코딩한다. seek해도 같은 키프레임(또는 그 앞)부터 같은 프레임을 다시 디코딩할 뿐이라
+    /// 결과는 같고 일은 줄어든다.
     fn accurate(&mut self, target: f64) -> Option<(ffmpeg::frame::Video, f64)> {
-        self.seek(target, true).ok()?;
+        let position = self.position;
+        let resume = match position {
+            Some(pos) if pos < target - EPSILON && self.can_peek() => self
+                .keyframe_pts(target, true)
+                .is_some_and(|(_, key)| key <= pos + EPSILON),
+            _ => false,
+        };
+        if !resume {
+            self.seek(target, true).ok()?;
+        }
+        self.position = None;
         while let Ok(Some((frame, t))) = self.next_frame(false) {
             if t >= target - EPSILON {
+                self.position = Some(t);
                 return Some((frame, t));
             }
         }
         None // target 이후 프레임이 없음 (끝을 넘음)
     }
 
-    /// target 직전/직후 키프레임의 시각을 디코딩 없이 패킷만 읽어 알아낸다: (pts, 초).
-    fn keyframe_pts(&mut self, target: f64, backward: bool) -> Option<(i64, f64)> {
-        self.seek(target, backward).ok()?;
-        let mut packet = ffmpeg::Packet::empty();
-        loop {
-            packet.read(&mut self.input).ok()?;
-            if packet.stream() == self.stream_index
-                && let Some(pts) = packet.pts().or_else(|| packet.dts())
-            {
-                return Some((pts, pts as f64 * self.time_base));
+    /// 키프레임 조회용 두 번째 열기를 (없으면 열어서) 쓸 수 있는지.
+    fn can_peek(&mut self) -> bool {
+        if self.peeker.is_none()
+            && let Some(path) = self.reopen.take()
+        {
+            self.peeker = ffmpeg::format::input(&path).ok();
+            if self.peeker.is_some() {
+                self.reopen = Some(path);
             }
+        }
+        self.peeker.is_some()
+    }
+
+    /// seek(target, backward)이 닿는 키프레임(target 직전/직후)의 시각을 디코딩 없이
+    /// 패킷만 읽어 알아낸다: (pts, 초). 두 번째 열기가 있으면 거기서 읽어 디코딩 위치를 지킨다.
+    fn keyframe_pts(&mut self, target: f64, backward: bool) -> Option<(i64, f64)> {
+        let ts = (target / self.time_base) as i64; // seek()과 같은 버림
+        if let Some((key, found)) = self.last_peek
+            && key == (ts, backward)
+        {
+            return found;
+        }
+        let found = if self.can_peek() {
+            let peeker = self.peeker.as_mut()?;
+            seek_input(peeker, self.stream_index, ts, backward).ok()?;
+            first_packet_pts(peeker, self.stream_index)
+        } else {
+            self.seek_ts(ts, backward).ok()?;
+            first_packet_pts(&mut self.input, self.stream_index)
+        }
+        .map(|pts| (pts, pts as f64 * self.time_base));
+        self.last_peek = Some(((ts, backward), found));
+        found
+    }
+
+    /// target 앞뒤 키프레임 중 더 가까운 쪽: (pts, 초). 패킷 시각만 보고 고른다.
+    fn nearest_keyframe(&mut self, target: f64) -> Option<(i64, f64)> {
+        let before = self.keyframe_pts(target, true);
+        let after = self.keyframe_pts(target, false);
+        match (before, after) {
+            (Some(b), Some(a)) => Some(if (b.1 - target).abs() <= (a.1 - target).abs() {
+                b
+            } else {
+                a
+            }),
+            (b, a) => b.or(a),
         }
     }
 
-    /// target 앞뒤 키프레임 중 더 가까운 쪽. 위치는 패킷 시각만 보고 고르고,
-    /// 고른 키프레임 한 장만 저지연 디코더로 디코딩한다.
-    fn nearest_keyframe(&mut self, target: f64) -> Option<(ffmpeg::frame::Video, f64)> {
-        let before = self.keyframe_pts(target, true);
-        let after = self.keyframe_pts(target, false);
-        let (pts, _) = match (before, after) {
-            (Some(b), Some(a)) => {
-                if (b.1 - target).abs() <= (a.1 - target).abs() {
-                    b
-                } else {
-                    a
-                }
-            }
-            (b, a) => b.or(a)?,
-        };
-        self.seek_ts(pts, true).ok()?;
-        self.next_frame(true).ok().flatten()
-    }
-
     /// seek_mode에 맞게 target(절대 시각)의 프레임을 고른다.
-    /// fast: 가장 가까운 키프레임이 tolerance(칸 간격의 절반) 안이면 그것, 더 멀면 정확하게.
+    /// fast: 가장 가까운 키프레임이 tolerance(칸 간격의 절반) 안이면 그 한 장만 저지연 디코더로
+    /// 디코딩하고, 더 멀면 정확하게.
     fn grab(
         &mut self,
         target: f64,
@@ -259,12 +367,41 @@ impl Decoding {
         tolerance: f64,
     ) -> Option<(ffmpeg::frame::Video, f64)> {
         if mode == SeekMode::Fast
-            && let Some((frame, t)) = self.nearest_keyframe(target)
+            && let Some((pts, key)) = self.nearest_keyframe(target)
+            && (key - target).abs() <= tolerance
+            && self.seek_ts(pts, true).is_ok()
+            && let Ok(Some((frame, t))) = self.next_frame(true)
             && (t - target).abs() <= tolerance
         {
+            self.keyframe_hits += 1;
             return Some((frame, t));
         }
         self.accurate(target)
+    }
+
+    /// 칸 하나: 요청 시각 t(파일 시작 기준)의 프레임. 실패하면 1초 앞에서 한 번 더 시도한다.
+    fn cell(
+        &mut self,
+        t: f64,
+        start: f64,
+        mode: SeekMode,
+        tolerance: f64,
+        size: (u32, u32),
+    ) -> Frame {
+        let mut got = self.grab(start + t, mode, tolerance);
+        if got.is_none() {
+            got = self.grab(start + (t - 1.0).max(0.0), mode, tolerance);
+        }
+        match got.and_then(|(frame, ft)| Some((self.frame_image(&frame, size)?, ft))) {
+            Some((image, ft)) => Frame {
+                time: ft - start,
+                image: Some(image),
+            },
+            None => Frame {
+                time: t,
+                image: None,
+            },
+        }
     }
 
     /// 칸 크기로 줄이고(애너모픽 보정 포함) display matrix대로 돌린다.
@@ -305,36 +442,55 @@ impl Decoding {
     }
 }
 
-/// 파일을 한 번 열고 시점마다 seek해 칸 크기 프레임을 뽑는다 (spec §7).
+/// 시점마다 seek해 칸 크기 프레임을 뽑는다 (spec §7).
 ///
+/// fast 모드에서 키프레임만으로 칸을 채우는 영상은 최대 workers개 스레드가 칸을 나눠 뽑는다.
+/// 첫 스레드는 source의 열린 파일을 쓰고, 나머지는 파일을 다시 연다 (여는 데 오래 걸린 파일은
+/// 혼자 뽑는다). 어느 스레드가 어떤 순서로 뽑아도 칸마다 고르는 프레임은 같다.
 /// 실패한 시점은 1초 앞에서 한 번 더 시도하고, 그래도 실패하면 image=None.
 pub fn extract_frames_from(
-    input: ffmpeg::format::context::Input,
+    source: Source,
     times: &[f64],
     size: (u32, u32),
     mode: SeekMode,
+    workers: usize,
 ) -> ExtractResult {
-    extract_with(Decoding::from_input(input), times, size, mode)
+    let reopen = source.open_seconds <= REOPEN_LIMIT_SECONDS;
+    let workers = if reopen { workers } else { 1 };
+    let first = Decoding::from_input(source.input, 0, reopen.then_some(source.path.as_path()));
+    extract_with(first, &source.path, times, size, mode, workers)
 }
 
-/// 파일을 열어 프레임을 뽑는다 (테스트·단독 사용용). 일괄 처리는 extract_frames_from을 쓴다.
+/// 파일을 열어 프레임을 뽑는다 (테스트용). 일괄 처리는 extract_frames_from을 쓴다.
 #[cfg(test)]
 pub fn extract_frames(
     path: &Path,
     times: &[f64],
     size: (u32, u32),
     mode: SeekMode,
+    workers: usize,
 ) -> ExtractResult {
-    extract_with(Decoding::open(path), times, size, mode)
+    extract_with(Decoding::open(path, 0), path, times, size, mode, workers)
+}
+
+/// 디코더 하나의 스레드 수. 칸을 나눠 뽑으면 코어를 나눠 쓴다 (0 = 자동).
+fn decoder_threads(workers: usize) -> usize {
+    if workers <= 1 {
+        return 0;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cores / workers).max(1)
 }
 
 fn extract_with(
     opened: Result<Decoding, ffmpeg::Error>,
+    path: &Path,
     times: &[f64],
     size: (u32, u32),
     mode: SeekMode,
+    workers: usize,
 ) -> ExtractResult {
-    let mut decoding = match opened {
+    let mut first = match opened {
         Ok(d) => d,
         Err(e) => {
             return ExtractResult {
@@ -349,7 +505,7 @@ fn extract_with(
             };
         }
     };
-    let start = decoding.start_time();
+    let start = first.start_time();
     // fast 모드 허용 오차: 칸 간격의 절반 (칸이 하나면 정확하게)
     let tolerance = if times.len() > 1 {
         (times[1] - times[0]) / 2.0
@@ -357,30 +513,53 @@ fn extract_with(
         0.0
     };
 
-    let mut frames = Vec::with_capacity(times.len());
-    for &t in times {
-        let mut got = decoding.grab(start + t, mode, tolerance);
-        if got.is_none() {
-            got = decoding.grab(start + (t - 1.0).max(0.0), mode, tolerance);
-        }
-        let frame = match got {
-            Some((frame, ft)) => match decoding.frame_image(&frame, size) {
-                Some(image) => Frame {
-                    time: ft - start,
-                    image: Some(image),
-                },
-                None => Frame {
-                    time: t,
-                    image: None,
-                },
-            },
-            None => Frame {
-                time: t,
-                image: None,
-            },
+    let mut slots: Vec<Option<Frame>> = vec![None; times.len()];
+    let Some(&t0) = times.first() else {
+        return ExtractResult {
+            frames: vec![],
+            warnings: vec![],
         };
-        frames.push(frame);
-    }
+    };
+    slots[0] = Some(first.cell(t0, start, mode, tolerance, size));
+    // 첫 칸을 키프레임 한 장으로 끝냈을 때만 나머지 칸을 나눈다. 정확한 시점까지 디코딩하는
+    // 영상은 디코더가 이미 코어를 다 쓰고, 혼자 이어서 디코딩하는 편이 빠르다 (측정).
+    let workers = if first.keyframe_hits > 0 {
+        workers.clamp(1, times.len() - 1)
+    } else {
+        1
+    };
+    let threads = decoder_threads(workers);
+    // 스레드마다 이어진 칸 묶음을 맡는다 (같은 키프레임 구간의 칸은 이어서 디코딩하도록)
+    let rest = times.len() - 1;
+    let chunk = |k: usize| 1 + k * rest / workers..1 + (k + 1) * rest / workers;
+    let work = |decoding: &mut Decoding, range: std::ops::Range<usize>| -> Vec<(usize, Frame)> {
+        range
+            .map(|i| (i, decoding.cell(times[i], start, mode, tolerance, size)))
+            .collect()
+    };
+    std::thread::scope(|scope| {
+        let others: Vec<_> = (1..workers)
+            .map(|k| {
+                scope.spawn(move || match Decoding::open(path, threads) {
+                    Ok(mut d) => work(&mut d, chunk(k)),
+                    Err(_) => Vec::new(), // 다시 열지 못한 묶음은 아래에서 첫 스레드가 뽑는다
+                })
+            })
+            .collect();
+        let mine = work(&mut first, chunk(0));
+        for (i, frame) in others
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .chain(mine)
+        {
+            slots[i] = Some(frame);
+        }
+    });
+    let frames: Vec<Frame> = slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| f.unwrap_or_else(|| first.cell(times[i], start, mode, tolerance, size)))
+        .collect();
 
     let warnings = frames
         .iter()
@@ -465,6 +644,7 @@ mod tests {
             &times,
             (240, 135),
             SeekMode::Accurate,
+            1,
         );
         assert!(r.warnings.is_empty());
         for (t, f) in times.iter().zip(&r.frames) {
@@ -478,11 +658,46 @@ mod tests {
         }
     }
 
+    /// 칸마다 seek하고 이어 디코딩도 나눠 뽑기도 하지 않는 기준 결과 (다시 열기 금지)
+    fn baseline(path: &Path, times: &[f64], size: (u32, u32), mode: SeekMode) -> ExtractResult {
+        probe::init();
+        let opened = ffmpeg::format::input(path).unwrap();
+        extract_with(
+            Decoding::from_input(opened, 0, None),
+            path,
+            times,
+            size,
+            mode,
+            1,
+        )
+    }
+
+    #[test]
+    fn resume_and_parallel_match_baseline() {
+        for (name, duration, mode) in [
+            ("기본_1080p30.mp4", 60.0, SeekMode::Fast), // 키프레임 드묾 → 이어 디코딩
+            ("기본_1080p30.mp4", 60.0, SeekMode::Accurate),
+            ("조각난.mp4", 30.0, SeekMode::Fast), // 키프레임 1초마다 → 칸 나눠 뽑기
+            ("조각난.mp4", 30.0, SeekMode::Accurate),
+        ] {
+            let times = plan_times(duration, 20, 0.0, 0.0).times;
+            let base = baseline(&media(name), &times, (160, 90), mode);
+            for workers in [1, 4] {
+                let r = extract_frames(&media(name), &times, (160, 90), mode, workers);
+                assert_eq!(base.warnings, r.warnings);
+                for (a, b) in base.frames.iter().zip(&r.frames) {
+                    assert_eq!(a.time, b.time, "{name} {mode:?} ×{workers}");
+                    assert!(a.image == b.image, "{name} {mode:?} {} 그림이 다름", a.time);
+                }
+            }
+        }
+    }
+
     #[test]
     fn fast_uses_nearest_keyframe() {
         // 1초마다 키프레임 (n + 0.023초) → 요청 시각에서 0.5초 안
         let times = plan_times(30.0, 20, 0.0, 0.0).times;
-        let r = extract_frames(&media("조각난.mp4"), &times, (320, 180), SeekMode::Fast);
+        let r = extract_frames(&media("조각난.mp4"), &times, (320, 180), SeekMode::Fast, 1);
         for (t, f) in times.iter().zip(&r.frames) {
             assert!(f.image.is_some());
             assert!((f.time - t).abs() <= 0.5 + 1e-6, "{t} → {}", f.time);
@@ -497,7 +712,7 @@ mod tests {
     #[test]
     fn fast_falls_back_when_keyframes_are_sparse() {
         let times = plan_times(10.0, 20, 0.0, 0.0).times;
-        let r = extract_frames(&media("무음.mp4"), &times, (160, 120), SeekMode::Fast);
+        let r = extract_frames(&media("무음.mp4"), &times, (160, 120), SeekMode::Fast, 1);
         let got: Vec<f64> = r.frames.iter().map(|f| f.time).collect();
         assert!(r.frames.iter().all(|f| f.image.is_some()));
         assert!(got.windows(2).all(|w| w[0] < w[1]), "순서·겹침: {got:?}");
@@ -516,9 +731,16 @@ mod tests {
             &[5.0],
             (320, 180),
             SeekMode::Accurate,
+            1,
         );
         assert_eq!(r.frames[0].image.as_ref().unwrap().dimensions(), (320, 180));
-        let r = extract_frames(&media("회전90.mp4"), &[2.0], (180, 320), SeekMode::Accurate);
+        let r = extract_frames(
+            &media("회전90.mp4"),
+            &[2.0],
+            (180, 320),
+            SeekMode::Accurate,
+            1,
+        );
         let image = r.frames[0].image.as_ref().unwrap();
         assert_eq!(image.dimensions(), (180, 320));
         // 회전되면 testsrc2의 세로 색 막대가 가로 줄무늬가 된다: 한 행은 거의 같은 색, 한 열은 바뀐다
@@ -544,6 +766,7 @@ mod tests {
             &[5.0, 1000.0],
             (160, 120),
             SeekMode::Accurate,
+            1,
         );
         assert!(r.frames[0].image.is_some() && r.frames[1].image.is_none());
         assert_eq!(
@@ -551,10 +774,22 @@ mod tests {
             ["00:16:40 프레임을 뽑지 못해 회색 칸으로 둡니다"]
         );
 
-        let r = extract_frames(&media("무음.mp4"), &[10.5], (160, 120), SeekMode::Accurate);
+        let r = extract_frames(
+            &media("무음.mp4"),
+            &[10.5],
+            (160, 120),
+            SeekMode::Accurate,
+            1,
+        );
         assert!(r.frames[0].image.is_some() && r.warnings.is_empty());
 
-        let r = extract_frames(&media("깨짐.mp4"), &[1.0, 2.0], (160, 120), SeekMode::Fast);
+        let r = extract_frames(
+            &media("깨짐.mp4"),
+            &[1.0, 2.0],
+            (160, 120),
+            SeekMode::Fast,
+            1,
+        );
         assert!(r.frames.iter().all(|f| f.image.is_none()));
         assert_eq!(r.warnings.len(), 1);
         assert!(r.warnings[0].contains("열 수 없어"));
@@ -564,6 +799,7 @@ mod tests {
             &[2.0],
             (160, 120),
             SeekMode::Fast,
+            1,
         );
         assert!(r.frames[0].image.is_some());
     }

@@ -3,15 +3,16 @@
 //! 화면 출력은 하지 않는다. 진행 표시·요약은 app.rs가 결과 값을 보고 한다.
 
 use crate::config::{OutputFormat, Settings};
-use crate::extract::{extract_frames_from, plan_times};
+use crate::extract::{Source, extract_frames_from, plan_times};
 use crate::fonts::FontFiles;
 use crate::formatting::header_lines;
 use crate::layout::{LayoutInput, WEBP_MAX_SIZE, compute_layout};
 use crate::probe;
 use crate::render::{render_sheet, save_sheet};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, mpsc};
 use std::time::Instant;
 
 pub const VIDEO_EXTENSIONS: [&str; 13] = [
@@ -35,6 +36,8 @@ pub struct InputItem {
 pub struct Context<'a> {
     pub settings: &'a Settings,
     pub fonts: &'a FontFiles,
+    /// 영상 한 개의 칸을 나눠 뽑을 최대 스레드 수
+    pub cell_workers: usize,
 }
 
 #[derive(Debug)]
@@ -237,7 +240,8 @@ pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
         }
         Err(e) => return finish(Status::Failed, e.0, None, warnings, timings),
     };
-    timings.push(("probe", step.elapsed().as_secs_f64()));
+    let open_seconds = step.elapsed().as_secs_f64();
+    timings.push(("probe", open_seconds));
 
     let lines = header_lines(&info, &s.header, s.language);
     let input = LayoutInput {
@@ -268,7 +272,12 @@ pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
         s.skip_end_seconds,
     );
     let size = (layout.cell_width as u32, layout.cell_height as u32);
-    let extracted = extract_frames_from(file, &plan.times, size, s.seek_mode);
+    let source = Source {
+        input: file,
+        path: video.to_path_buf(),
+        open_seconds,
+    };
+    let extracted = extract_frames_from(source, &plan.times, size, s.seek_mode, ctx.cell_workers);
     timings.push(("extract", step.elapsed().as_secs_f64()));
     warnings.extend(plan.warnings);
     warnings.extend(extracted.warnings);
@@ -310,6 +319,89 @@ pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
     timings.push(("save", step.elapsed().as_secs_f64()));
 
     finish(Status::Done, String::new(), Some(out), warnings, timings)
+}
+
+/// 항목 하나를 처리한다. 처리 전에 이미 실패한 항목(파일 없음 등)은 바로 실패 결과.
+pub fn process_item(item: &InputItem, ctx: &Context) -> VideoResult {
+    match &item.error {
+        Some(error) => VideoResult {
+            status: Status::Failed,
+            message: error.clone(),
+            output: None,
+            warnings: vec![],
+            seconds: 0.0,
+            timings: vec![],
+        },
+        None => process_video(&item.path, ctx),
+    }
+}
+
+/// 영상들을 jobs개 스레드로 동시에 처리하고, 결과는 입력 순서대로 report에 넘긴다.
+///
+/// before(i)는 i번째 결과를 기다리기 전에 불린다 (진행 표시용). stop()이 true가 되면 새 영상은
+/// 시작하지 않고 이미 시작한 영상까지만 넘긴다. 결과를 넘긴 개수를 돌려준다.
+pub fn process_in_order(
+    items: &[InputItem],
+    ctx: &Context,
+    jobs: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+    mut before: impl FnMut(usize),
+    mut report: impl FnMut(usize, VideoResult),
+) -> usize {
+    // (시작한 영상 수, 더 시작하지 않음)
+    let claim = Mutex::new((0usize, false));
+    let lock = || claim.lock().unwrap_or_else(|e| e.into_inner());
+    let take = || {
+        let mut c = lock();
+        if c.1 || c.0 >= items.len() || stop() {
+            c.1 = true;
+            return None;
+        }
+        c.0 += 1;
+        Some(c.0 - 1)
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.clamp(1, items.len().max(1)) {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                while let Some(i) = take() {
+                    if tx.send((i, process_item(&items[i], ctx))).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut finished = HashMap::new();
+        for i in 0..items.len() {
+            {
+                let mut c = lock();
+                if i >= c.0 && (c.1 || stop()) {
+                    c.1 = true;
+                    return i;
+                }
+            }
+            before(i);
+            let result = loop {
+                if let Some(r) = finished.remove(&i) {
+                    break Some(r);
+                }
+                match rx.recv() {
+                    Ok((j, r)) => {
+                        finished.insert(j, r);
+                    }
+                    Err(_) => break None, // 모든 스레드가 끝남: i번째는 시작되지 않았다
+                }
+            };
+            match result {
+                Some(r) => report(i, r),
+                None => return i,
+            }
+        }
+        items.len()
+    })
 }
 
 #[cfg(test)]
@@ -403,6 +495,7 @@ mod tests {
         let ctx = Context {
             settings: &settings,
             fonts: &fonts,
+            cell_workers: 4,
         };
 
         let r = process_video(&video, &ctx);
@@ -429,5 +522,57 @@ mod tests {
         let r = process_video(&doc, &ctx);
         assert_eq!(r.status, Status::Skipped);
         assert!(r.message.starts_with("영상 아님"));
+    }
+
+    #[test]
+    fn parallel_results_in_input_order_and_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let fonts = find_fonts("");
+        let mut items: Vec<InputItem> = (1..=4)
+            .map(|i| {
+                let path = dir.path().join(format!("{i}화.mp4"));
+                std::fs::copy(media("무음.mp4"), &path).unwrap();
+                InputItem { path, error: None }
+            })
+            .collect();
+        items.insert(
+            2,
+            InputItem {
+                path: dir.path().join("없음.mp4"),
+                error: Some("파일 없음".into()),
+            },
+        );
+        let settings = Settings::default();
+        let ctx = Context {
+            settings: &settings,
+            fonts: &fonts,
+            cell_workers: 1,
+        };
+
+        let mut before = Vec::new();
+        let mut reported = Vec::new();
+        let n = process_in_order(
+            &items,
+            &ctx,
+            3,
+            &|| false,
+            |i| before.push(i),
+            |i, r| reported.push((i, r.status)),
+        );
+        assert_eq!(n, 5);
+        assert_eq!(before, [0, 1, 2, 3, 4]);
+        use Status::*;
+        assert_eq!(
+            reported,
+            [(0, Done), (1, Done), (2, Failed), (3, Done), (4, Done)]
+        );
+        for i in [1, 2, 3, 4] {
+            assert!(dir.path().join(format!("{i}화_sheet.webp")).exists());
+        }
+
+        // 처음부터 멈춤: 아무것도 시작하지 않는다
+        let mut calls = 0;
+        let n = process_in_order(&items, &ctx, 3, &|| true, |_| calls += 1, |_, _| {});
+        assert_eq!((n, calls), (0, 0));
     }
 }

@@ -43,8 +43,8 @@ const TIMESTAMP_BOX_ALPHA: u32 = 153; // round(255 × 0.6)
 const TIMESTAMP_TEXT: Rgb = [0xFF, 0xFF, 0xFF];
 const ELLIPSIS: char = '…';
 
-/// 저장 중인 임시 파일. 콘솔 창을 닫을 때 app.rs가 지운다.
-pub static SAVING: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 저장 중인 임시 파일들 (영상을 동시에 처리하면 여럿). 콘솔 창을 닫을 때 app.rs가 지운다.
+pub static SAVING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Pillow와 같은 크기 규칙의 글꼴: size는 em 크기(px)다.
 pub struct Text<'a> {
@@ -336,14 +336,20 @@ pub fn save_sheet(
     let tmp = path.with_file_name(format!(".{name}.tmp"));
     let result = (|| {
         let bytes = encode(image, format, quality)?;
-        *SAVING.lock().unwrap_or_else(|e| e.into_inner()) = Some(tmp.clone());
+        SAVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tmp.clone());
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, path)
     })();
-    *SAVING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    SAVING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|p| *p != tmp);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }

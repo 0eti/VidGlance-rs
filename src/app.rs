@@ -2,7 +2,7 @@
 //!
 //! 출력·입력 대기·종료 코드는 이 모듈에서만 다룬다.
 
-use crate::batch::{Context, InputItem, Status, VideoResult, collect_inputs, process_video};
+use crate::batch::{Context, InputItem, Status, VideoResult, collect_inputs, process_in_order};
 use crate::config::{
     ConfigError, LoadedConfig, Settings, apply_overrides, load_config, resolve_config_path,
 };
@@ -11,6 +11,7 @@ use crate::probe;
 use crate::render::SAVING;
 use clap::Parser;
 use serde_json::{Map, Value, json};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -173,17 +174,30 @@ fn finish(pause: bool, ok: bool, delay: i64) {
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-/// Ctrl+C·Ctrl+Break는 지금 영상까지만 하고 멈춘다. 창 닫기는 저장 중인 임시 파일을 지운다.
+/// Ctrl+C·Ctrl+Break는 지금 처리 중인 영상까지만 하고 멈춘다. 창 닫기는 저장 중인 임시 파일을 지운다.
 unsafe extern "system" fn on_console_event(event: u32) -> i32 {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
     INTERRUPTED.store(true, Ordering::SeqCst);
     if event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT {
         // 창 닫기·로그오프·종료: 이 함수가 끝나면 프로세스가 끝난다
-        if let Some(tmp) = SAVING.lock().ok().and_then(|g| g.clone()) {
+        let saving = SAVING.lock().map(|g| g.clone()).unwrap_or_default();
+        for tmp in saving {
             let _ = std::fs::remove_file(tmp);
         }
     }
     1
+}
+
+/// 동시에 처리할 영상 수. 4K AV1 5개에서 1개씩 1.6초 → 3개씩 1.0초, 더 늘려도 비슷했다.
+const VIDEO_JOBS: usize = 3;
+/// 영상이 하나일 때 칸을 나눠 뽑을 스레드 수 (4K AV1 0.34초 → 0.30초).
+/// 영상을 동시에 처리할 때는 코어가 이미 차서 나누지 않는다.
+const CELL_WORKERS: usize = 4;
+
+/// (동시에 처리할 영상 수, 영상 하나의 칸을 나눠 뽑을 스레드 수)
+fn parallelism(videos: usize) -> (usize, usize) {
+    let jobs = VIDEO_JOBS.min(videos).max(1);
+    (jobs, if jobs == 1 { CELL_WORKERS } else { 1 })
 }
 
 // --- 출력 -------------------------------------------------------------------
@@ -280,52 +294,52 @@ fn run(args: &Args, pause: bool) -> i32 {
     if !args.quiet {
         print_setup(&loaded, &settings, args.verbose, &fonts);
     }
+    let items: Vec<InputItem> = collect_inputs(&args.inputs, settings.recursive, &settings.suffix);
+    let (jobs, cell_workers) = parallelism(items.len());
     let ctx = Context {
         settings: &settings,
         fonts: &fonts,
+        cell_workers,
     };
-
-    let items: Vec<InputItem> = collect_inputs(&args.inputs, settings.recursive, &settings.suffix);
     let mut counts: HashMap<Status, usize> = HashMap::new();
     let width = items.len().to_string().len();
-    let mut interrupted = false;
-    for (index, item) in items.iter().enumerate() {
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            interrupted = true;
-            break;
-        }
-        if !args.quiet {
-            let name = item
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
-            print!("[{:>width$}/{}] {name} … ", index + 1, items.len());
-            let _ = std::io::stdout().flush();
-        }
-        let result = match &item.error {
-            Some(error) => VideoResult {
-                status: Status::Failed,
-                message: error.clone(),
-                output: None,
-                warnings: vec![],
-                seconds: 0.0,
-                timings: vec![],
-            },
-            None => process_video(&item.path, &ctx),
-        };
-        *counts.entry(result.status).or_default() += 1;
-        if !args.quiet {
-            println!("{}", describe(&result));
-            for w in &result.warnings {
-                println!("    경고: {w}");
+    let waiting = Cell::new(false); // "[i/n] 이름 … "을 찍고 결과를 기다리는 중
+    let stop = || INTERRUPTED.load(Ordering::SeqCst);
+    let reported = process_in_order(
+        &items,
+        &ctx,
+        jobs,
+        &stop,
+        |index| {
+            if !args.quiet {
+                let name = items[index]
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
+                print!("[{:>width$}/{}] {name} … ", index + 1, items.len());
+                let _ = std::io::stdout().flush();
+                waiting.set(true);
             }
-            if args.verbose && !result.timings.is_empty() {
-                println!("    {}", timings(&result));
+        },
+        |_, result| {
+            *counts.entry(result.status).or_default() += 1;
+            if !args.quiet {
+                waiting.set(false);
+                println!("{}", describe(&result));
+                for w in &result.warnings {
+                    println!("    경고: {w}");
+                }
+                if args.verbose && !result.timings.is_empty() {
+                    println!("    {}", timings(&result));
+                }
             }
-        }
+        },
+    );
+    if waiting.get() {
+        println!(); // 중단되어 시작하지 않은 영상
     }
-    interrupted |= INTERRUPTED.load(Ordering::SeqCst);
+    let interrupted = reported < items.len() || INTERRUPTED.load(Ordering::SeqCst);
 
     if !args.quiet {
         println!("{RULE}");
