@@ -12,7 +12,8 @@
 |---|---|---|
 | 배포 | onefile 82MB 또는 onedir 폴더 210MB | **exe 하나 24MB** (FFmpeg·dav1d·폰트 포함, 다른 DLL 필요 없음) |
 | 시작 | onefile 약 4~5초, onedir 0.3초 | **0.02초** |
-| 4K AV1 영상 1개 | onedir 약 1.2초 | 약 1.0초 |
+| 4K AV1 영상 1개 | onedir 약 1.1초 | **약 0.3초** |
+| 9.6GB fragmented MP4 (3시간 27분) | onedir 약 4.1초 | **약 2.1초** |
 | 설정 파일 위치 | exe 옆 `config.json` | **항상 `%APPDATA%\VidGlance\config.json`** (exe 옆에는 만들지 않음) |
 | 영상 정보 | ffprobe.exe 실행 | exe 안의 FFmpeg 라이브러리로 직접 읽음 (`ffmpeg_dir` 설정·`--ffmpeg-dir` 없음) |
 
