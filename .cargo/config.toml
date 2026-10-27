@@ -1,0 +1,8 @@
+# VC++ 런타임까지 exe 안에 넣는다 (vcpkg x64-windows-static과 같은 /MT)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# 정적 FFmpeg를 찾을 vcpkg 위치 (환경 변수가 있으면 그것을 쓴다)
+VCPKG_ROOT = { value = "D:\\Dev\\Tools\\vcpkg", force = false }
+VCPKGRS_TRIPLET = { value = "x64-windows-static-release", force = false }

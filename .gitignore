@@ -1,0 +1,7 @@
+/target/
+*_sheet.*
+*.exe
+config.json
+
+# 개인 작업 문서 (저장소에 올리지 않음)
+CLAUDE.md

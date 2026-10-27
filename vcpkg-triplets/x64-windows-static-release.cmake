@@ -1,0 +1,5 @@
+# FFmpeg 정적 빌드용 vcpkg triplet: 정적 라이브러리 + 정적 CRT(/MT), 릴리스만 (디버그 빌드 생략으로 시간 절반)
+set(VCPKG_TARGET_ARCHITECTURE x64)
+set(VCPKG_CRT_LINKAGE static)
+set(VCPKG_LIBRARY_LINKAGE static)
+set(VCPKG_BUILD_TYPE release)
