@@ -72,7 +72,11 @@ struct Decoding {
     input: ffmpeg::format::context::Input,
     stream_index: usize,
     time_base: f64,
-    decoder: ffmpeg::decoder::Video,
+    /// 정확한 시점까지 연달아 디코딩할 때: 프레임·슬라이스 스레드 (처리량 위주)
+    sequential: ffmpeg::decoder::Video,
+    /// 키프레임 한 장만 뽑을 때: 저지연 (패킷 하나 넣으면 바로 나옴). 프레임 스레드는
+    /// 첫 프레임 전에 패킷을 여러 장 받아 디코딩하므로 한 장만 필요할 때 2배 넘게 느리다.
+    single: ffmpeg::decoder::Video,
     eof_sent: bool,
     rotation: i32,
     scaler: Option<(scaling::Context, ScalerKey)>,
@@ -88,19 +92,29 @@ impl Decoding {
         let time_base = tb.numerator() as f64 / tb.denominator() as f64;
         let rotation =
             ((probe::stream_rotation(&stream) as f64 / 90.0).round() as i32 * 90).rem_euclid(360);
-        let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
-        unsafe {
-            // PyAV의 thread_type = "AUTO"와 같게: 프레임·슬라이스 스레드, 개수 자동
-            let raw = ctx.as_mut_ptr();
-            (*raw).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
-            (*raw).thread_count = 0;
-        }
-        let decoder = ctx.decoder().video()?;
+        let open_decoder = |low_delay: bool| -> Result<ffmpeg::decoder::Video, ffmpeg::Error> {
+            let mut ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+            unsafe {
+                let raw = ctx.as_mut_ptr();
+                (*raw).thread_count = 0; // 스레드 개수 자동
+                if low_delay {
+                    (*raw).thread_type = ffi::FF_THREAD_SLICE;
+                    (*raw).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+                } else {
+                    // PyAV의 thread_type = "AUTO"와 같게
+                    (*raw).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
+                }
+            }
+            ctx.decoder().video()
+        };
+        let sequential = open_decoder(false)?;
+        let single = open_decoder(true)?;
         Ok(Decoding {
             input,
             stream_index,
             time_base,
-            decoder,
+            sequential,
+            single,
             eof_sent: false,
             rotation,
             scaler: None,
@@ -119,7 +133,12 @@ impl Decoding {
 
     /// target(초) 직전(backward) 또는 직후 키프레임으로 seek하고 디코더를 비운다.
     fn seek(&mut self, target: f64, backward: bool) -> Result<(), ffmpeg::Error> {
-        let ts = (target / self.time_base) as i64; // PyAV int(target / time_base)와 같은 버림
+        // PyAV int(target / time_base)와 같은 버림
+        self.seek_ts((target / self.time_base) as i64, backward)
+    }
+
+    /// 스트림 time_base 단위 시각으로 seek한다.
+    fn seek_ts(&mut self, ts: i64, backward: bool) -> Result<(), ffmpeg::Error> {
         let flags = if backward {
             ffi::AVSEEK_FLAG_BACKWARD
         } else {
@@ -131,16 +150,25 @@ impl Decoding {
         if ret < 0 {
             return Err(ffmpeg::Error::from(ret));
         }
-        self.decoder.flush();
+        self.sequential.flush();
+        self.single.flush();
         self.eof_sent = false;
         Ok(())
     }
 
-    /// 다음 디코딩된 프레임과 그 시각(초). 끝이면 None.
-    fn next_frame(&mut self) -> Result<Option<(ffmpeg::frame::Video, f64)>, ffmpeg::Error> {
+    /// 다음 디코딩된 프레임과 그 시각(초). 끝이면 None. single이면 저지연 디코더를 쓴다.
+    fn next_frame(
+        &mut self,
+        single: bool,
+    ) -> Result<Option<(ffmpeg::frame::Video, f64)>, ffmpeg::Error> {
         let mut frame = ffmpeg::frame::Video::empty();
         loop {
-            match self.decoder.receive_frame(&mut frame) {
+            let decoder = if single {
+                &mut self.single
+            } else {
+                &mut self.sequential
+            };
+            match decoder.receive_frame(&mut frame) {
                 Ok(()) => {
                     if let Some(pts) = frame.pts().or_else(|| frame.timestamp()) {
                         let t = pts as f64 * self.time_base;
@@ -160,11 +188,11 @@ impl Decoding {
                 Ok(()) => {
                     if packet.stream() == self.stream_index {
                         // 손상된 패킷 하나는 넘어간다 (다음 패킷으로 계속)
-                        let _ = self.decoder.send_packet(&packet);
+                        let _ = decoder.send_packet(&packet);
                     }
                 }
                 Err(ffmpeg::Error::Eof) => {
-                    let _ = self.decoder.send_eof();
+                    let _ = decoder.send_eof();
                     self.eof_sent = true;
                 }
                 Err(e) => return Err(e),
@@ -172,16 +200,10 @@ impl Decoding {
         }
     }
 
-    /// target 직전/직후 키프레임으로 seek해 첫 프레임 하나만 디코딩한다. 그 방향에 없으면 None.
-    fn keyframe(&mut self, target: f64, backward: bool) -> Option<(ffmpeg::frame::Video, f64)> {
-        self.seek(target, backward).ok()?;
-        self.next_frame().ok().flatten()
-    }
-
     /// target 이전 키프레임부터 디코딩해 target 이상인 첫 프레임 (ffmpeg 입력 seek과 같음).
     fn accurate(&mut self, target: f64) -> Option<(ffmpeg::frame::Video, f64)> {
         self.seek(target, true).ok()?;
-        while let Ok(Some((frame, t))) = self.next_frame() {
+        while let Ok(Some((frame, t))) = self.next_frame(false) {
             if t >= target - EPSILON {
                 return Some((frame, t));
             }
@@ -189,18 +211,37 @@ impl Decoding {
         None // target 이후 프레임이 없음 (끝을 넘음)
     }
 
-    /// target 앞뒤 키프레임 중 더 가까운 쪽 (디코딩은 2프레임뿐).
-    fn nearest_keyframe(&mut self, target: f64) -> Option<(ffmpeg::frame::Video, f64)> {
-        let before = self.keyframe(target, true);
-        let after = self.keyframe(target, false);
-        match (before, after) {
-            (Some(b), Some(a)) => Some(if (b.1 - target).abs() <= (a.1 - target).abs() {
-                b
-            } else {
-                a
-            }),
-            (b, a) => b.or(a),
+    /// target 직전/직후 키프레임의 시각을 디코딩 없이 패킷만 읽어 알아낸다: (pts, 초).
+    fn keyframe_pts(&mut self, target: f64, backward: bool) -> Option<(i64, f64)> {
+        self.seek(target, backward).ok()?;
+        let mut packet = ffmpeg::Packet::empty();
+        loop {
+            packet.read(&mut self.input).ok()?;
+            if packet.stream() == self.stream_index
+                && let Some(pts) = packet.pts().or_else(|| packet.dts())
+            {
+                return Some((pts, pts as f64 * self.time_base));
+            }
         }
+    }
+
+    /// target 앞뒤 키프레임 중 더 가까운 쪽. 위치는 패킷 시각만 보고 고르고,
+    /// 고른 키프레임 한 장만 저지연 디코더로 디코딩한다.
+    fn nearest_keyframe(&mut self, target: f64) -> Option<(ffmpeg::frame::Video, f64)> {
+        let before = self.keyframe_pts(target, true);
+        let after = self.keyframe_pts(target, false);
+        let (pts, _) = match (before, after) {
+            (Some(b), Some(a)) => {
+                if (b.1 - target).abs() <= (a.1 - target).abs() {
+                    b
+                } else {
+                    a
+                }
+            }
+            (b, a) => b.or(a)?,
+        };
+        self.seek_ts(pts, true).ok()?;
+        self.next_frame(true).ok().flatten()
     }
 
     /// seek_mode에 맞게 target(절대 시각)의 프레임을 고른다.
