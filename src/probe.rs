@@ -126,14 +126,30 @@ pub fn first_video(
 }
 
 /// 영상 정보를 읽는다. 실패하면 ProbeError (메시지는 사용자에게 그대로 보여준다).
+#[cfg(test)]
 pub fn probe(path: &Path) -> Result<VideoInfo, ProbeError> {
+    open(path).map(|(info, _)| info)
+}
+
+/// 영상을 열어 정보를 읽고, 연 파일도 함께 돌려준다 (추출에서 다시 열지 않도록).
+/// 인덱스 없는 fragmented MP4는 열 때마다 조각 헤더 전체를 훑어 1초 넘게 걸린다.
+pub fn open(path: &Path) -> Result<(VideoInfo, ffmpeg::format::context::Input), ProbeError> {
     init();
     let size_bytes = std::fs::metadata(path)
         .map(|m| m.len())
         .map_err(|e| ProbeError(format!("영상을 읽을 수 없음: {e}")))?;
     let input =
         ffmpeg::format::input(path).map_err(|e| ProbeError(format!("영상을 읽을 수 없음: {e}")))?;
-    let video = first_video(&input).ok_or_else(|| ProbeError("비디오 스트림 없음".into()))?;
+    let info = read_info(path, size_bytes, &input)?;
+    Ok((info, input))
+}
+
+fn read_info(
+    path: &Path,
+    size_bytes: u64,
+    input: &ffmpeg::format::context::Input,
+) -> Result<VideoInfo, ProbeError> {
+    let video = first_video(input).ok_or_else(|| ProbeError("비디오 스트림 없음".into()))?;
     let audio = input
         .streams()
         .find(|s| s.parameters().medium() == Type::Audio);

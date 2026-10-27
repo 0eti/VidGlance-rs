@@ -8,6 +8,7 @@ use ffmpeg::software::scaling;
 use ffmpeg::util::format::Pixel;
 use ffmpeg_next as ffmpeg;
 use image::RgbImage;
+#[cfg(test)]
 use std::path::Path;
 
 /// 칸 사이 최소 간격(초). 이보다 촘촘하면 "매우 짧은 영상"으로 본다.
@@ -83,9 +84,14 @@ struct Decoding {
 }
 
 impl Decoding {
+    #[cfg(test)]
     fn open(path: &Path) -> Result<Self, ffmpeg::Error> {
         probe::init();
-        let input = ffmpeg::format::input(path)?;
+        Self::from_input(ffmpeg::format::input(path)?)
+    }
+
+    /// 이미 연 파일로 시작한다 (probe::open이 연 것을 그대로 쓴다).
+    fn from_input(input: ffmpeg::format::context::Input) -> Result<Self, ffmpeg::Error> {
         let stream = probe::first_video(&input).ok_or(ffmpeg::Error::StreamNotFound)?;
         let stream_index = stream.index();
         let tb = stream.time_base();
@@ -302,13 +308,33 @@ impl Decoding {
 /// 파일을 한 번 열고 시점마다 seek해 칸 크기 프레임을 뽑는다 (spec §7).
 ///
 /// 실패한 시점은 1초 앞에서 한 번 더 시도하고, 그래도 실패하면 image=None.
+pub fn extract_frames_from(
+    input: ffmpeg::format::context::Input,
+    times: &[f64],
+    size: (u32, u32),
+    mode: SeekMode,
+) -> ExtractResult {
+    extract_with(Decoding::from_input(input), times, size, mode)
+}
+
+/// 파일을 열어 프레임을 뽑는다 (테스트·단독 사용용). 일괄 처리는 extract_frames_from을 쓴다.
+#[cfg(test)]
 pub fn extract_frames(
     path: &Path,
     times: &[f64],
     size: (u32, u32),
     mode: SeekMode,
 ) -> ExtractResult {
-    let mut decoding = match Decoding::open(path) {
+    extract_with(Decoding::open(path), times, size, mode)
+}
+
+fn extract_with(
+    opened: Result<Decoding, ffmpeg::Error>,
+    times: &[f64],
+    size: (u32, u32),
+    mode: SeekMode,
+) -> ExtractResult {
+    let mut decoding = match opened {
         Ok(d) => d,
         Err(e) => {
             return ExtractResult {

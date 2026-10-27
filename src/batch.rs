@@ -3,11 +3,11 @@
 //! 화면 출력은 하지 않는다. 진행 표시·요약은 app.rs가 결과 값을 보고 한다.
 
 use crate::config::{OutputFormat, Settings};
-use crate::extract::{extract_frames, plan_times};
+use crate::extract::{extract_frames_from, plan_times};
 use crate::fonts::FontFiles;
 use crate::formatting::header_lines;
 use crate::layout::{LayoutInput, WEBP_MAX_SIZE, compute_layout};
-use crate::probe::probe;
+use crate::probe;
 use crate::render::{render_sheet, save_sheet};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -224,8 +224,8 @@ pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
     }
 
     let step = Instant::now();
-    let info = match probe(video) {
-        Ok(info) => info,
+    let (info, file) = match probe::open(video) {
+        Ok(opened) => opened,
         Err(e) if !is_video_ext(video) => {
             return finish(
                 Status::Skipped,
@@ -268,7 +268,7 @@ pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
         s.skip_end_seconds,
     );
     let size = (layout.cell_width as u32, layout.cell_height as u32);
-    let extracted = extract_frames(video, &plan.times, size, s.seek_mode);
+    let extracted = extract_frames_from(file, &plan.times, size, s.seek_mode);
     timings.push(("extract", step.elapsed().as_secs_f64()));
     warnings.extend(plan.warnings);
     warnings.extend(extracted.warnings);
