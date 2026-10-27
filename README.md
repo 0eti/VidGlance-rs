@@ -13,6 +13,8 @@
 | 배포 | onefile 82MB 또는 onedir 폴더 210MB | **exe 하나 24MB** (FFmpeg·dav1d·폰트 포함, 다른 DLL 필요 없음) |
 | 시작 | onefile 약 4~5초, onedir 0.3초 | **0.02초** |
 | 4K AV1 영상 1개 | onedir 약 1.1초 | **약 0.3초** |
+| 4K AV1 영상 5개 한꺼번에 | onedir 약 5.4초 | **약 1.2초** (3개씩 동시에 처리) |
+| 1080p H.264 60초 (키프레임 8초 간격) | onedir 약 2.6초 | **약 1.3초** |
 | 9.6GB fragmented MP4 (3시간 27분) | onedir 약 4.1초 | **약 2.1초** |
 | 설정 파일 위치 | exe 옆 `config.json` | **항상 `%APPDATA%\VidGlance\config.json`** (exe 옆에는 만들지 않음) |
 | 영상 정보 | ffprobe.exe 실행 | exe 안의 FFmpeg 라이브러리로 직접 읽음 (`ffmpeg_dir` 설정·`--ffmpeg-dir` 없음) |
@@ -25,6 +27,7 @@ Python 버전의 `config.json`을 `%APPDATA%\VidGlance\`에 복사해도 그대�
 2. 영상 파일(여러 개 가능)이나 폴더를 **`VidGlance.exe` 아이콘 위로 끌어다 놓습니다.**
 3. 각 영상과 같은 폴더에 `영상이름_sheet.webp`가 생깁니다. 모두 성공하면 3초 뒤 창이 저절로 닫히고, 실패가 있으면 이유를 보여 준 뒤 키 입력을 기다립니다.
 
+- 여러 영상은 3개씩 동시에 처리하고, 결과는 놓은 순서대로 보여 줍니다.
 - 이미 시트가 있는 영상은 건너뜁니다(`overwrite`로 바꿀 수 있음).
 - 폴더를 놓으면 그 안의 영상(`mp4 mkv avi mov wmv flv webm m4v ts m2ts mpg mpeg 3gp`)만 처리합니다. 하위 폴더는 `recursive`가 `true`일 때만.
 - exe를 **더블클릭**하면 설정 파일 위치를 알려 줍니다(없으면 만듭니다).
