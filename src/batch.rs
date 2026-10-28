@@ -721,6 +721,26 @@ mod tests {
         let r = run(&doc);
         assert_eq!(r.status, Status::Skipped);
         assert!(r.message.starts_with("영상 아님"));
+
+        // 사진은 실패가 아니라 "영상 아님" (spec §5)
+        let photo = dir.path().join("사진.jpg");
+        image::RgbImage::from_pixel(64, 48, image::Rgb([200, 100, 50]))
+            .save(&photo)
+            .unwrap();
+        let r = run(&photo);
+        assert_eq!(
+            (r.status, r.message.as_str()),
+            (Status::Skipped, "영상 아님 (이미지 파일)")
+        );
+    }
+
+    #[test]
+    fn panic_becomes_failed_result() {
+        let r = guarded(|| panic!("칸 {}개", 0));
+        assert_eq!(r.status, Status::Failed);
+        assert_eq!(r.message, "예기치 않은 오류: 칸 0개");
+        let r = guarded(|| panic!("고정 문구"));
+        assert_eq!(r.message, "예기치 않은 오류: 고정 문구");
     }
 
     #[test]

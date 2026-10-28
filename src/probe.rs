@@ -185,6 +185,12 @@ pub fn stream_rotation(stream: &ffmpeg::format::stream::Stream) -> i32 {
     }
 }
 
+/// 사진 한 장을 읽는 FFmpeg 형식인지 (image2, jpeg_pipe, png_pipe, webp_pipe 등).
+/// 사진도 길이 0.04초짜리 영상으로 열리므로 형식 이름으로 가린다 (spec §5: 사진은 영상 아님).
+fn is_image_format(name: &str) -> bool {
+    name == "image2" || name == "image2pipe" || name.ends_with("_pipe")
+}
+
 /// 첫 비디오 스트림 (앨범 아트 attached_pic 제외)
 pub fn first_video(
     input: &ffmpeg::format::context::Input,
@@ -217,6 +223,9 @@ fn read_info(
     size_bytes: u64,
     input: &ffmpeg::format::context::Input,
 ) -> Result<VideoInfo, ProbeError> {
+    if is_image_format(input.format().name()) {
+        return Err(ProbeError("이미지 파일".into()));
+    }
     let video = first_video(input).ok_or_else(|| ProbeError("비디오 스트림 없음".into()))?;
     let audio = input
         .streams()
@@ -458,6 +467,25 @@ mod tests {
     fn anamorphic_aspect_and_rotation() {
         assert!((probe(&media("애너모픽.mp4")).unwrap().aspect() - 16.0 / 9.0).abs() < 1e-9);
         assert_eq!(probe(&media("회전90.mp4")).unwrap().rotation, 90);
+    }
+
+    #[test]
+    fn images_are_not_videos() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = image::RgbImage::from_pixel(64, 48, image::Rgb([200, 100, 50]));
+        for (name, format) in [
+            ("사진.jpg", image::ImageFormat::Jpeg),
+            ("사진.png", image::ImageFormat::Png),
+            ("확장자만 영상.mp4", image::ImageFormat::Png), // 내용으로 판별
+        ] {
+            let path = dir.path().join(name);
+            image.save_with_format(&path, format).unwrap();
+            assert_eq!(
+                probe(&path),
+                Err(ProbeError("이미지 파일".into())),
+                "{name}"
+            );
+        }
     }
 
     #[test]
