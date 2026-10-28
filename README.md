@@ -174,6 +174,40 @@ VidGlance.exe [옵션] <파일 또는 폴더...>
   - 여러 영상은 3개씩 동시에 처리합니다.
   - 파일은 Rust로 직접 읽습니다. Windows에서 FFmpeg 기본 파일 읽기는 조각이 많은 MP4를 여는 데 3배 넘게 느립니다.
 
+## 구조
+
+```mermaid
+flowchart LR
+    drop(["영상·폴더를<br/>exe에 끌어다 놓기"])
+    out(["영상이름_sheet.webp"])
+
+    subgraph run["전체 흐름 · app.rs"]
+        direction TB
+        cfg["설정 읽기<br/><code>config.rs</code>"]
+        collect["입력 모으기<br/>시트 이름 정하기<br/><code>batch.rs</code>"]
+        jobs["영상 3개씩 동시 처리<br/>결과는 입력 순서대로<br/><code>batch.rs</code>"]
+        cfg --> collect --> jobs
+    end
+
+    subgraph video["영상 하나 처리 · batch.rs"]
+        direction TB
+        probe["영상 정보 읽기<br/><code>probe.rs</code> + FFmpeg"]
+        header["헤더 줄 만들기<br/><code>formatting.rs</code>"]
+        layout["격자·글자 크기 계산<br/><code>layout.rs</code>"]
+        extract["프레임 뽑기<br/><code>extract.rs</code> + FFmpeg"]
+        render["시트 그리기<br/><code>render.rs</code> + 내장 폰트"]
+        save["WebP로 저장<br/><code>render.rs</code>"]
+        probe --> header --> layout --> extract --> render --> save
+    end
+
+    drop --> run --> video --> out
+```
+
+- 출력(콘솔 메시지·키 대기·종료 코드)은 `app.rs`에서만 다루고, 나머지 모듈은 값이나 오류를 돌려줍니다.
+- FFmpeg는 `probe.rs`와 `extract.rs`에서만 부릅니다. `layout.rs`는 파일을 읽거나 쓰지 않는 계산만 합니다.
+- 영상이 하나뿐이고 첫 칸이 키프레임이면, `extract.rs`가 나머지 칸을 4개 스레드로 나눠 뽑습니다.
+- 저장은 임시 파일(`.이름_sheet.webp.tmp`)에 쓴 뒤 이름을 바꿉니다. 중간에 창을 닫아도 깨진 시트가 남지 않습니다.
+
 ## 빌드
 
 필요한 것: Rust(MSVC), Visual Studio Build Tools(C++), LLVM(libclang), [vcpkg](https://github.com/microsoft/vcpkg).
