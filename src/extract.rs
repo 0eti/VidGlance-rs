@@ -84,8 +84,8 @@ pub struct Source {
     pub open_seconds: f64,
 }
 
-/// 키프레임 조회 결과: ((seek 시각, backward), (pts, 초))
-type PeekCache = ((i64, bool), Option<(i64, f64)>);
+/// 키프레임 조회 결과: (seek 시각, (pts, 초))
+type PeekCache = (i64, Option<(i64, f64)>);
 
 /// swscale 설정 키: (원본 픽셀 형식, 원본 가로, 원본 세로, 출력 가로, 출력 세로)
 type ScalerKey = (Pixel, u32, u32, u32, u32);
@@ -111,8 +111,9 @@ struct Decoding {
     /// reopen이 None이면(여는 데 오래 걸리는 파일) 열지 않고 본 파일에서 알아본다.
     peeker: Option<ffmpeg::format::context::Input>,
     reopen: Option<PathBuf>,
-    /// 마지막 키프레임 조회: ((seek 시각, backward), 결과)
-    last_peek: Option<PeekCache>,
+    /// 방향별 마지막 키프레임 조회 ([직후, 직전]). fast 모드가 앞뒤를 둘 다 본 뒤 정확한 시점으로
+    /// 넘어가면 직전 조회를 다시 쓴다.
+    last_peek: [Option<PeekCache>; 2],
     /// fast 모드에서 키프레임 한 장으로 끝낸 칸 수
     keyframe_hits: usize,
     rotation: i32,
@@ -211,7 +212,7 @@ impl Decoding {
             position: None,
             peeker: None,
             reopen: reopen.map(Path::to_path_buf),
-            last_peek: None,
+            last_peek: [None, None],
             keyframe_hits: 0,
             rotation,
             scaler: None,
@@ -335,8 +336,9 @@ impl Decoding {
     /// 패킷만 읽어 알아낸다: (pts, 초). 두 번째 열기가 있으면 거기서 읽어 디코딩 위치를 지킨다.
     fn keyframe_pts(&mut self, target: f64, backward: bool) -> Option<(i64, f64)> {
         let ts = (target / self.time_base) as i64; // seek()과 같은 버림
-        if let Some((key, found)) = self.last_peek
-            && key == (ts, backward)
+        let slot = backward as usize;
+        if let Some((key, found)) = self.last_peek[slot]
+            && key == ts
         {
             return found;
         }
@@ -349,7 +351,7 @@ impl Decoding {
             first_packet_pts(&mut self.input, self.stream_index)
         }
         .map(|pts| (pts, pts as f64 * self.time_base));
-        self.last_peek = Some(((ts, backward), found));
+        self.last_peek[slot] = Some((ts, found));
         found
     }
 
