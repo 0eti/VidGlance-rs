@@ -232,6 +232,8 @@ fn lower(path: &Path) -> String {
 ///
 /// 같은 폴더에서 이름이 같고 확장자만 다른 영상은 이번에 넣지 않았어도 순서에 넣는다.
 /// 그래야 일부만 다시 넣어도 이름이 바뀌지 않고, 이미 만든 시트는 "이미 있음"으로 건너뛴다.
+/// 영상 확장자가 아닌 항목(같이 끌어 온 자막·사진 등)은 영상 뒤에 둔다. 대개 "영상 아님"으로
+/// 건너뛰므로, 함께 넣었는지에 따라 영상의 번호가 밀리지 않게 한다.
 pub fn output_paths(items: &[InputItem], settings: &Settings) -> Vec<PathBuf> {
     let mut folders: HashMap<String, Vec<PathBuf>> = HashMap::new(); // 폴더별 영상 목록 (한 번만 읽는다)
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new(); // 기본 시트 경로 → 그 경로가 되는 영상들
@@ -263,7 +265,11 @@ pub fn output_paths(items: &[InputItem], settings: &Settings) -> Vec<PathBuf> {
         );
     }
     for group in groups.values_mut() {
-        group.sort_by(|a, b| compare_natural(&natural_key(a), &natural_key(b)));
+        group.sort_by(|a, b| {
+            (!is_video_ext(a))
+                .cmp(&!is_video_ext(b))
+                .then_with(|| compare_natural(&natural_key(a), &natural_key(b)))
+        });
         group.dedup_by(|a, b| lower(a) == lower(b));
     }
     items
@@ -630,6 +636,14 @@ mod tests {
         // 하나만 넣어도 같은 폴더의 같은 이름 영상을 순서에 넣어 이름이 같다
         let only = [item(root.join("a.mp4"))];
         assert_eq!(file_names(output_paths(&only, &s)), ["a_sheet(3).webp"]);
+
+        // 같은 이름의 자막을 같이 넣어도 영상 번호는 그대로이고, 자막은 영상 뒤로 간다
+        std::fs::write(root.join("a.ass"), b"").unwrap();
+        let with_subtitle = [item(root.join("a.ass")), item(root.join("a.mp4"))];
+        assert_eq!(
+            file_names(output_paths(&with_subtitle, &s)),
+            ["a_sheet(4).webp", "a_sheet(3).webp"]
+        );
 
         // output_dir이 절대 경로면 다른 폴더의 같은 이름도 겹친다 (넣은 것끼리)
         let out_dir = root.join("모음");
