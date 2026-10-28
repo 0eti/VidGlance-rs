@@ -183,10 +183,7 @@ unsafe extern "system" fn on_console_event(event: u32) -> i32 {
     INTERRUPTED.store(true, Ordering::SeqCst);
     if event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT {
         // 창 닫기·로그오프·종료: 이 함수가 끝나면 프로세스가 끝난다
-        let saving = SAVING.lock().map(|g| g.clone()).unwrap_or_default();
-        for tmp in saving {
-            let _ = std::fs::remove_file(tmp);
-        }
+        SAVING.discard();
     }
     1
 }

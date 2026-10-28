@@ -9,7 +9,7 @@ use ab_glyph::{Font, FontArc, GlyphId, OutlinedGlyph, PxScale, ScaleFont, point}
 use image::{ImageEncoder, RgbImage};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 type Rgb = [u8; 3];
 
@@ -43,8 +43,54 @@ const TIMESTAMP_BOX_ALPHA: u32 = 153; // round(255 × 0.6)
 const TIMESTAMP_TEXT: Rgb = [0xFF, 0xFF, 0xFF];
 const ELLIPSIS: char = '…';
 
-/// 저장 중인 임시 파일들 (영상을 동시에 처리하면 여럿). 콘솔 창을 닫을 때 app.rs가 지운다.
-pub static SAVING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// 저장 중인 임시 파일들 (영상을 동시에 처리하면 여럿). 콘솔 창을 닫을 때 app.rs가 discard()로 지운다.
+pub static SAVING: TempFiles = TempFiles::new();
+
+pub struct TempFiles {
+    /// (저장 중인 임시 파일, 창을 닫는 중이라 더 만들지 않음)
+    state: Mutex<(Vec<PathBuf>, bool)>,
+}
+
+impl TempFiles {
+    pub const fn new() -> Self {
+        TempFiles {
+            state: Mutex::new((Vec::new(), false)),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, (Vec<PathBuf>, bool)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 임시 파일을 만들고 목록에 올린다. 만들기와 올리기를 한 잠금 안에서 해서, 그 사이에
+    /// 창을 닫아(discard) 목록에 없는 임시 파일이 남는 일이 없다.
+    fn create(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        let mut state = self.lock();
+        if state.1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "창을 닫는 중",
+            ));
+        }
+        let file = std::fs::File::create(path)?;
+        state.0.push(path.to_path_buf());
+        Ok(file)
+    }
+
+    fn finish(&self, path: &Path) {
+        self.lock().0.retain(|p| p != path);
+    }
+
+    /// 저장 중인 임시 파일을 모두 지우고, 이후로는 새로 만들지 않는다 (창 닫기·로그오프).
+    /// 쓰는 중인 파일도 지울 수 있다 (Rust는 FILE_SHARE_DELETE로 연다).
+    pub fn discard(&self) {
+        let mut state = self.lock();
+        state.1 = true;
+        for tmp in state.0.drain(..) {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
 
 /// Pillow와 같은 크기 규칙의 글꼴: size는 em 크기(px)다.
 pub struct Text<'a> {
@@ -353,6 +399,16 @@ pub fn save_sheet(
     format: OutputFormat,
     quality: i64,
 ) -> std::io::Result<()> {
+    save_with(&SAVING, image, path, format, quality)
+}
+
+fn save_with(
+    temp: &TempFiles,
+    image: &RgbImage,
+    path: &Path,
+    format: OutputFormat,
+    quality: i64,
+) -> std::io::Result<()> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -360,20 +416,13 @@ pub fn save_sheet(
     let tmp = path.with_file_name(format!(".{name}.tmp"));
     let result = (|| {
         let bytes = encode(image, format, quality)?;
-        SAVING
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(tmp.clone());
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = temp.create(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, path)
     })();
-    SAVING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|p| *p != tmp);
+    temp.finish(&tmp);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -551,6 +600,24 @@ mod tests {
         assert!(fitted.contains('…'));
         assert!(font.length(&fitted) <= 300.0);
         assert!(fitted.starts_with("File Name: ") && fitted.ends_with("_끝.mp4"));
+    }
+
+    #[test]
+    fn discard_removes_temp_and_blocks_new_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp = TempFiles::new();
+        // 쓰는 중인(열린) 임시 파일도 지운다
+        let writing = dir.path().join(".a_sheet.webp.tmp");
+        let file = temp.create(&writing).unwrap();
+        temp.discard();
+        drop(file);
+        assert!(!writing.exists());
+        // 닫는 중에는 새 시트를 저장하지 않고 아무 파일도 남기지 않는다
+        let image = RgbImage::from_pixel(8, 8, image::Rgb([0, 0, 0]));
+        let out = dir.path().join("b_sheet.webp");
+        let err = save_with(&temp, &image, &out, OutputFormat::Webp, 85).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
