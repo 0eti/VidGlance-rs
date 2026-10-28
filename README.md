@@ -15,7 +15,7 @@
 | 4K AV1 영상 1개 | onedir 약 1.1초 | **약 0.3초** |
 | 4K AV1 영상 5개 한꺼번에 | onedir 약 5.4초 | **약 1.2초** (3개씩 동시에 처리) |
 | 1080p H.264 60초 (키프레임 8초 간격) | onedir 약 2.6초 | **약 1.3초** |
-| 9.6GB fragmented MP4 (3시간 27분) | onedir 약 4.1초 | **약 2.1초** |
+| 9.6GB fragmented MP4 (3시간 27분) | onedir 약 4.1초 | **약 1.2초** |
 | 설정 파일 위치 | exe 옆 `config.json` | **항상 `%APPDATA%\VidGlance\config.json`** (exe 옆에는 만들지 않음) |
 | 영상 정보 | ffprobe.exe 실행 | exe 안의 FFmpeg 라이브러리로 직접 읽음 (`ffmpeg_dir` 설정·`--ffmpeg-dir` 없음) |
 
