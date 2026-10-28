@@ -19,7 +19,7 @@
 | 설정 파일 위치 | exe 옆 `config.json` | **항상 `%APPDATA%\VidGlance\config.json`** (exe 옆에는 만들지 않음) |
 | 영상 정보 | ffprobe.exe 실행 | exe 안의 FFmpeg 라이브러리로 직접 읽음 (`ffmpeg_dir` 설정·`--ffmpeg-dir` 없음) |
 
-Python 버전의 `config.json`을 `%APPDATA%\VidGlance\`에 복사해도 그대로 쓸 수 있습니다(`ffmpeg_dir`은 경고 없이 무시).
+Python 버전의 `config.json`을 `%APPDATA%\VidGlance\`에 복사해도 그대로 쓸 수 있습니다(`ffmpeg_dir`은 경고 없이 무시). 타임스탬프 위치(`timestamp_position`)는 Rust 버전에만 있습니다.
 
 ## 사용법
 
@@ -62,6 +62,7 @@ Python 버전의 `config.json`을 `%APPDATA%\VidGlance\`에 복사해도 그대�
   "output_dir": "",
   "overwrite": false,
   "show_timestamp": true,
+  "timestamp_position": "bottom-right",
   "recursive": false,
   "skip_start_seconds": 0,
   "skip_end_seconds": 0,
@@ -85,6 +86,7 @@ Python 버전의 `config.json`을 `%APPDATA%\VidGlance\`에 복사해도 그대�
 | `output_dir` | 저장 폴더. 비우면 영상 폴더, 상대 경로면 각 영상 폴더 기준 | 경로 |
 | `overwrite` | 이미 있는 시트를 덮어쓸지 | `true` / `false` |
 | `show_timestamp` | 칸마다 타임스탬프를 그릴지 | `true` / `false` |
+| `timestamp_position` | 칸 안 타임스탬프 위치 | `"bottom-right"` / `"bottom-left"` / `"top-right"` / `"top-left"` / `"center"` |
 | `recursive` | 폴더를 놓았을 때 하위 폴더까지 | `true` / `false` |
 | `skip_start_seconds`, `skip_end_seconds` | 앞·뒤에서 뺄 구간(초) | 0 이상 |
 | `seek_mode` | `fast`는 균등 시점에서 가장 가까운 키프레임(빠름, 오차 보통 1~3초), `accurate`는 정확한 시점(느림). 타임스탬프는 항상 실제 장면 시각 | `"fast"` / `"accurate"` |

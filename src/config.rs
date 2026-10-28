@@ -46,6 +46,40 @@ pub enum SeekMode {
     Accurate,
 }
 
+/// 칸 안 타임스탬프 위치 (Rust 버전에만 있는 설정).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampPosition {
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
+    Center,
+}
+
+const TIMESTAMP_POSITIONS: [(&str, TimestampPosition); 5] = [
+    ("bottom-right", TimestampPosition::BottomRight),
+    ("bottom-left", TimestampPosition::BottomLeft),
+    ("top-right", TimestampPosition::TopRight),
+    ("top-left", TimestampPosition::TopLeft),
+    ("center", TimestampPosition::Center),
+];
+
+impl TimestampPosition {
+    pub fn name(self) -> &'static str {
+        TIMESTAMP_POSITIONS
+            .iter()
+            .find(|(_, p)| *p == self)
+            .map_or("bottom-right", |(n, _)| n)
+    }
+
+    fn from_name(name: &str) -> Self {
+        TIMESTAMP_POSITIONS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(TimestampPosition::BottomRight, |(_, p)| *p)
+    }
+}
+
 /// 헤더 항목별 표시 여부 (spec §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderSettings {
@@ -118,6 +152,7 @@ pub struct Settings {
     pub output_dir: String,
     pub overwrite: bool,
     pub show_timestamp: bool,
+    pub timestamp_position: TimestampPosition,
     pub recursive: bool,
     pub skip_start_seconds: f64,
     pub skip_end_seconds: f64,
@@ -157,6 +192,7 @@ pub fn defaults_map() -> Map<String, Value> {
         "output_dir": "",
         "overwrite": false,
         "show_timestamp": true,
+        "timestamp_position": "bottom-right",
         "recursive": false,
         "skip_start_seconds": 0,
         "skip_end_seconds": 0,
@@ -229,6 +265,7 @@ fn check(key: &str, v: &Value) -> Option<String> {
         "language" => choice(&["en", "ko"]),
         "format" => choice(&["webp", "jpg", "png"]),
         "seek_mode" => choice(&["fast", "accurate"]),
+        "timestamp_position" => choice(&TIMESTAMP_POSITIONS.map(|(n, _)| n)),
         "output_dir" | "font" => string(),
         "overwrite" | "show_timestamp" | "recursive" => boolean(),
         "skip_start_seconds" | "skip_end_seconds" => match v.as_f64() {
@@ -335,6 +372,7 @@ fn settings_from(data: &Map<String, Value>) -> Settings {
         output_dir: text("output_dir"),
         overwrite: flag("overwrite"),
         show_timestamp: flag("show_timestamp"),
+        timestamp_position: TimestampPosition::from_name(&text("timestamp_position")),
         recursive: flag("recursive"),
         skip_start_seconds: number("skip_start_seconds"),
         skip_end_seconds: number("skip_end_seconds"),
@@ -542,6 +580,7 @@ fn to_map(s: &Settings) -> Map<String, Value> {
         "output_dir": s.output_dir,
         "overwrite": s.overwrite,
         "show_timestamp": s.show_timestamp,
+        "timestamp_position": s.timestamp_position.name(),
         "recursive": s.recursive,
         "skip_start_seconds": s.skip_start_seconds,
         "skip_end_seconds": s.skip_end_seconds,
@@ -581,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn default_key_order_matches_python_minus_ffmpeg_dir() {
+    fn default_key_order_python_minus_ffmpeg_dir_plus_timestamp_position() {
         let defaults = defaults_map();
         let keys: Vec<&str> = defaults.keys().map(String::as_str).collect();
         assert_eq!(
@@ -601,6 +640,7 @@ mod tests {
                 "output_dir",
                 "overwrite",
                 "show_timestamp",
+                "timestamp_position",
                 "recursive",
                 "skip_start_seconds",
                 "skip_end_seconds",
@@ -702,6 +742,10 @@ mod tests {
             (
                 r#"{"seek_mode": "slow"}"#,
                 r#"seek_mode: "fast" / "accurate" 중 하나여야 합니다"#,
+            ),
+            (
+                r#"{"timestamp_position": "middle"}"#,
+                r#"timestamp_position: "bottom-right" / "bottom-left" / "top-right" / "top-left" / "center" 중 하나여야 합니다"#,
             ),
             (
                 r#"{"header": {"fps": "yes"}}"#,

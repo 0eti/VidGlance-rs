@@ -1,6 +1,6 @@
 //! 시트 합성, 저장 (spec §8, §9). Python 버전의 Pillow 그리기를 같은 좌표 규칙으로 옮겼다.
 
-use crate::config::{OutputFormat, ThemeName};
+use crate::config::{OutputFormat, ThemeName, TimestampPosition};
 use crate::extract::Frame;
 use crate::fonts::FontFiles;
 use crate::formatting::format_duration;
@@ -189,8 +189,15 @@ fn darken(image: &mut RgbImage, x0: i64, y0: i64, x1: i64, y1: i64, alpha: u32) 
     }
 }
 
-/// 칸 오른쪽 아래에 반투명 박스 + 흰 글자
-fn draw_timestamp(image: &mut RgbImage, rect: Rect, text: &str, font: &Text, layout: &Layout) {
+/// 칸 안 position 자리에 반투명 박스 + 흰 글자. 모서리는 칸 가장자리에서 margin만큼 띄운다.
+fn draw_timestamp(
+    image: &mut RgbImage,
+    rect: Rect,
+    text: &str,
+    font: &Text,
+    layout: &Layout,
+    position: TimestampPosition,
+) {
     // Pillow textbbox((0,0), anchor="lt"): 위쪽 기준은 어센더 선
     let ascent = font.ascent();
     let (l, t, r, b) = font.ink_bounds(text);
@@ -201,10 +208,24 @@ fn draw_timestamp(image: &mut RgbImage, rect: Rect, text: &str, font: &Text, lay
         (ascent + b).ceil(),
     );
     let pad = layout.timestamp_box_padding as f32;
-    let box_right = (rect.x + rect.w - layout.timestamp_margin) as f32;
-    let box_bottom = (rect.y + rect.h - layout.timestamp_margin) as f32;
-    let box_left = box_right - (right - left) - 2.0 * pad;
-    let box_top = box_bottom - (bottom - top) - 2.0 * pad;
+    let (box_w, box_h) = ((right - left) + 2.0 * pad, (bottom - top) + 2.0 * pad);
+    let m = layout.timestamp_margin;
+    let (x0, y0) = (rect.x as f32, rect.y as f32);
+    let near_x = (rect.x + m) as f32;
+    let far_x = (rect.x + rect.w - m) as f32 - box_w;
+    let near_y = (rect.y + m) as f32;
+    let far_y = (rect.y + rect.h - m) as f32 - box_h;
+    let (box_left, box_top) = match position {
+        TimestampPosition::BottomRight => (far_x, far_y),
+        TimestampPosition::BottomLeft => (near_x, far_y),
+        TimestampPosition::TopRight => (far_x, near_y),
+        TimestampPosition::TopLeft => (near_x, near_y),
+        TimestampPosition::Center => (
+            x0 + ((rect.w as f32 - box_w) / 2.0).floor(),
+            y0 + ((rect.h as f32 - box_h) / 2.0).floor(),
+        ),
+    };
+    let (box_right, box_bottom) = (box_left + box_w, box_top + box_h);
     darken(
         image,
         box_left as i64,
@@ -228,7 +249,7 @@ pub fn render_sheet(
     frames: &[Frame],
     fonts: &FontFiles,
     theme_name: ThemeName,
-    show_timestamp: bool,
+    timestamp: Option<TimestampPosition>, // None이면 그리지 않음
 ) -> RgbImage {
     let colors = theme(theme_name);
     let mut sheet = RgbImage::from_pixel(
@@ -283,13 +304,14 @@ pub fn render_sheet(
                 image::imageops::replace(&mut sheet, image, rect.x, rect.y);
             }
         }
-        if show_timestamp {
+        if let Some(position) = timestamp {
             draw_timestamp(
                 &mut sheet,
                 *rect,
                 &format_duration(frame.time),
                 &ts_font,
                 layout,
+                position,
             );
         }
     }
@@ -396,7 +418,7 @@ mod tests {
         let l = layout(0);
         let mut fs = frames(&l, 2, [10, 200, 30]);
         fs[1].image = None;
-        let sheet = render_sheet(&l, &[], &fs, &fonts, ThemeName::Dark, false);
+        let sheet = render_sheet(&l, &[], &fs, &fonts, ThemeName::Dark, None);
         assert_eq!(sheet.dimensions(), (l.width as u32, l.height as u32));
         assert_eq!(sheet.get_pixel(1, 1).0, theme(ThemeName::Dark).background);
         let (c0, c1, c2) = (l.cells[0], l.cells[1], l.cells[2]);
@@ -421,7 +443,7 @@ mod tests {
             &frames(&l, 4, [255, 255, 255]),
             &fonts,
             ThemeName::Light,
-            true,
+            Some(TimestampPosition::BottomRight),
         );
         let r = l.cells[0];
         let m = l.timestamp_margin;
@@ -445,11 +467,68 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_positions() {
+        let fonts = find_fonts("");
+        let l = layout(0);
+        let r = l.cells[0];
+        let m = l.timestamp_margin;
+        let (left, right) = (r.x + m, r.x + r.w - m - 1);
+        let (top, bottom) = (r.y + m, r.y + r.h - m - 1);
+        let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
+        let dim = |p: [u8; 3]| p.iter().all(|&c| (c as i32 - 102).abs() <= 2);
+        // (위치, 박스 안이어야 할 점, 박스 밖이어야 할 점들)
+        let cases = [
+            (
+                TimestampPosition::BottomLeft,
+                (left, bottom),
+                [(right, bottom), (left, top)],
+            ),
+            (
+                TimestampPosition::TopRight,
+                (right, top),
+                [(right, bottom), (left, top)],
+            ),
+            (
+                TimestampPosition::TopLeft,
+                (left, top),
+                [(right, top), (left, bottom)],
+            ),
+            (
+                TimestampPosition::Center,
+                (cx, cy),
+                [(left, top), (right, bottom)],
+            ),
+        ];
+        for (position, inside, outside) in cases {
+            let sheet = render_sheet(
+                &l,
+                &[],
+                &frames(&l, 4, [255, 255, 255]),
+                &fonts,
+                ThemeName::Light,
+                Some(position),
+            );
+            let px = |(x, y): (i64, i64)| sheet.get_pixel(x as u32, y as u32).0;
+            assert!(dim(px(inside)), "{position:?} 안쪽 {:?}", px(inside));
+            for p in outside {
+                assert_eq!(px(p), [255, 255, 255], "{position:?} 바깥 {p:?}");
+            }
+        }
+    }
+
+    #[test]
     fn header_drawn_in_header_area() {
         let fonts = find_fonts("");
         let l = layout(2);
         let lines = vec!["파일명: 한글.mp4".to_string(), "크기: 1.00MB".to_string()];
-        let sheet = render_sheet(&l, &lines, &[], &fonts, ThemeName::Light, true);
+        let sheet = render_sheet(
+            &l,
+            &lines,
+            &[],
+            &fonts,
+            ThemeName::Light,
+            Some(TimestampPosition::BottomRight),
+        );
         let dark = (0..l.cells[0].y as u32)
             .flat_map(|y| (0..l.width as u32).map(move |x| (x, y)))
             .filter(|&(x, y)| sheet.get_pixel(x, y).0[0] < 50)

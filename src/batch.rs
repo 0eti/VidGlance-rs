@@ -298,7 +298,7 @@ pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
         &extracted.frames,
         ctx.fonts,
         s.theme,
-        s.show_timestamp,
+        s.show_timestamp.then_some(s.timestamp_position),
     );
     timings.push(("render", step.elapsed().as_secs_f64()));
 
