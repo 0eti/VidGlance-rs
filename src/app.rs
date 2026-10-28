@@ -2,7 +2,10 @@
 //!
 //! 출력·입력 대기·종료 코드는 이 모듈에서만 다룬다.
 
-use crate::batch::{Context, InputItem, Status, VideoResult, collect_inputs, process_in_order};
+use crate::batch::{
+    Context, InputItem, Status, VideoResult, collect_inputs, output_paths, pending_count,
+    process_in_order,
+};
 use crate::config::{
     ConfigError, LoadedConfig, Settings, apply_overrides, load_config, resolve_config_path,
 };
@@ -295,7 +298,8 @@ fn run(args: &Args, pause: bool) -> i32 {
         print_setup(&loaded, &settings, args.verbose, &fonts);
     }
     let items: Vec<InputItem> = collect_inputs(&args.inputs, settings.recursive, &settings.suffix);
-    let (jobs, cell_workers) = parallelism(items.len());
+    let outputs = output_paths(&items, &settings);
+    let (jobs, cell_workers) = parallelism(pending_count(&items, &outputs, settings.overwrite));
     let ctx = Context {
         settings: &settings,
         fonts: &fonts,
@@ -307,6 +311,7 @@ fn run(args: &Args, pause: bool) -> i32 {
     let stop = || INTERRUPTED.load(Ordering::SeqCst);
     let reported = process_in_order(
         &items,
+        &outputs,
         &ctx,
         jobs,
         &stop,

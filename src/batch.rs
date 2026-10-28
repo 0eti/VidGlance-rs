@@ -286,6 +286,16 @@ pub fn output_paths(items: &[InputItem], settings: &Settings) -> Vec<PathBuf> {
         .collect()
 }
 
+/// 실제로 처리할 항목 수: 처리 전에 실패한 항목(파일 없음)과 "이미 있음"으로 건너뛸 항목은 뺀다.
+/// 동시 처리 수를 정할 때 쓴다 (폴더를 다시 넣어 새 영상이 하나뿐이면 칸을 나눠 뽑도록).
+pub fn pending_count(items: &[InputItem], outputs: &[PathBuf], overwrite: bool) -> usize {
+    items
+        .iter()
+        .zip(outputs)
+        .filter(|(item, out)| item.error.is_none() && (overwrite || !out.exists()))
+        .count()
+}
+
 /// 영상 한 개의 시트를 out에 만든다. 에러 대신 VideoResult로 결과를 돌려준다.
 pub fn process_video(video: &Path, out: &Path, ctx: &Context) -> VideoResult {
     let began = Instant::now();
@@ -450,18 +460,18 @@ fn guarded(work: impl FnOnce() -> VideoResult) -> VideoResult {
 
 /// 영상들을 jobs개 스레드로 동시에 처리하고, 결과는 입력 순서대로 report에 넘긴다.
 ///
-/// before(i)는 i번째 결과를 기다리기 전에 불린다 (진행 표시용). stop()이 true가 되면 새 영상은
-/// 시작하지 않고 이미 시작한 영상까지만 넘긴다. 결과를 넘긴 개수를 돌려준다.
+/// outputs는 output_paths(items)의 결과다. before(i)는 i번째 결과를 기다리기 전에 불린다
+/// (진행 표시용). stop()이 true가 되면 새 영상은 시작하지 않고 이미 시작한 영상까지만 넘긴다.
+/// 결과를 넘긴 개수를 돌려준다.
 pub fn process_in_order(
     items: &[InputItem],
+    outputs: &[PathBuf],
     ctx: &Context,
     jobs: usize,
     stop: &(dyn Fn() -> bool + Sync),
     mut before: impl FnMut(usize),
     mut report: impl FnMut(usize, VideoResult),
 ) -> usize {
-    let outputs = output_paths(items, ctx.settings);
-    let outputs = &outputs;
     // (시작한 영상 수, 더 시작하지 않음)
     let claim = Mutex::new((0usize, false));
     let lock = || claim.lock().unwrap_or_else(|e| e.into_inner());
@@ -768,10 +778,13 @@ mod tests {
             cell_workers: 1,
         };
 
+        let outputs = output_paths(&items, &settings);
+        assert_eq!(pending_count(&items, &outputs, false), 4); // 파일 없음 제외
         let mut before = Vec::new();
         let mut reported = Vec::new();
         let n = process_in_order(
             &items,
+            &outputs,
             &ctx,
             3,
             &|| false,
@@ -789,9 +802,21 @@ mod tests {
             assert!(dir.path().join(format!("{i}화_sheet.webp")).exists());
         }
 
+        // 시트가 생겼으니 다시 넣으면 처리할 것이 없다 (overwrite면 다시 4개)
+        assert_eq!(pending_count(&items, &outputs, false), 0);
+        assert_eq!(pending_count(&items, &outputs, true), 4);
+
         // 처음부터 멈춤: 아무것도 시작하지 않는다
         let mut calls = 0;
-        let n = process_in_order(&items, &ctx, 3, &|| true, |_| calls += 1, |_, _| {});
+        let n = process_in_order(
+            &items,
+            &outputs,
+            &ctx,
+            3,
+            &|| true,
+            |_| calls += 1,
+            |_, _| {},
+        );
         assert_eq!((n, calls), (0, 0));
     }
 }
