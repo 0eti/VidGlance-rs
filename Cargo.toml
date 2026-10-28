@@ -1,6 +1,6 @@
 [package]
 name = "vidglance"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "영상을 끌어다 놓으면 정보 헤더 + 프레임 격자 썸네일 시트(webp)를 만드는 Windows 도구"
 publish = false
