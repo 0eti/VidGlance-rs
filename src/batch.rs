@@ -102,14 +102,27 @@ fn compare_natural(a: &[Part], b: &[Part]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
+/// 이미 만든 시트인지: `*{suffix}.{fmt}` 또는 이름이 겹쳐 번호가 붙은 `*{suffix}(N).{fmt}`.
 fn is_sheet(path: &Path, suffix: &str) -> bool {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    SHEET_FORMATS
-        .iter()
-        .any(|fmt| name.ends_with(&format!("{suffix}.{fmt}").to_lowercase()))
+    let suffix = suffix.to_lowercase();
+    SHEET_FORMATS.iter().any(|fmt| {
+        let Some(stem) = name.strip_suffix(&format!(".{fmt}")) else {
+            return false;
+        };
+        let stem = match stem.strip_suffix(')').and_then(|s| s.rsplit_once('(')) {
+            Some((before, digits))
+                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                before
+            }
+            _ => stem,
+        };
+        stem.ends_with(&suffix)
+    })
 }
 
 pub fn is_video_ext(path: &Path) -> bool {
@@ -195,11 +208,83 @@ pub fn output_path(video: &Path, settings: &Settings) -> PathBuf {
     ))
 }
 
-/// 영상 한 개의 시트를 만든다. 에러 대신 VideoResult로 결과를 돌려준다.
-pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
+/// `a_sheet.webp`의 n번째(n ≥ 2) 이름: `a_sheet(n).webp`
+fn numbered(path: &Path, n: usize) -> PathBuf {
+    if n <= 1 {
+        return path.to_path_buf();
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    path.with_file_name(format!("{stem}({n}){ext}"))
+}
+
+fn lower(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+/// 항목마다 시트 경로. 서로 다른 영상이 같은 경로가 되면 자연 정렬 순으로 둘째부터 `(2)`, `(3)`…
+///
+/// 같은 폴더에서 이름이 같고 확장자만 다른 영상은 이번에 넣지 않았어도 순서에 넣는다.
+/// 그래야 일부만 다시 넣어도 이름이 바뀌지 않고, 이미 만든 시트는 "이미 있음"으로 건너뛴다.
+pub fn output_paths(items: &[InputItem], settings: &Settings) -> Vec<PathBuf> {
+    let mut folders: HashMap<String, Vec<PathBuf>> = HashMap::new(); // 폴더별 영상 목록 (한 번만 읽는다)
+    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new(); // 기본 시트 경로 → 그 경로가 되는 영상들
+    for item in items {
+        let base = lower(&output_path(&item.path, settings));
+        let group = groups.entry(base.clone()).or_default();
+        group.push(item.path.clone());
+        let Some(parent) = item.path.parent() else {
+            continue;
+        };
+        let siblings = folders.entry(lower(parent)).or_insert_with(|| {
+            std::fs::read_dir(parent)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.is_file() && is_video_ext(p) && !is_sheet(p, &settings.suffix)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        group.extend(
+            siblings
+                .iter()
+                .filter(|p| lower(&output_path(p, settings)) == base)
+                .cloned(),
+        );
+    }
+    for group in groups.values_mut() {
+        group.sort_by(|a, b| compare_natural(&natural_key(a), &natural_key(b)));
+        group.dedup_by(|a, b| lower(a) == lower(b));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let base = output_path(&item.path, settings);
+            let group = &groups[&lower(&base)];
+            let rank = group
+                .iter()
+                .position(|p| lower(p) == lower(&item.path))
+                .unwrap_or(0);
+            numbered(&base, rank + 1)
+        })
+        .collect()
+}
+
+/// 영상 한 개의 시트를 out에 만든다. 에러 대신 VideoResult로 결과를 돌려준다.
+pub fn process_video(video: &Path, out: &Path, ctx: &Context) -> VideoResult {
     let began = Instant::now();
     let s = ctx.settings;
-    let out = output_path(video, s);
+    let out = out.to_path_buf();
     let mut timings = Vec::new();
     let mut warnings = Vec::new();
 
@@ -321,8 +406,8 @@ pub fn process_video(video: &Path, ctx: &Context) -> VideoResult {
     finish(Status::Done, String::new(), Some(out), warnings, timings)
 }
 
-/// 항목 하나를 처리한다. 처리 전에 이미 실패한 항목(파일 없음 등)은 바로 실패 결과.
-pub fn process_item(item: &InputItem, ctx: &Context) -> VideoResult {
+/// 항목 하나를 out에 처리한다. 처리 전에 이미 실패한 항목(파일 없음 등)은 바로 실패 결과.
+pub fn process_item(item: &InputItem, out: &Path, ctx: &Context) -> VideoResult {
     match &item.error {
         Some(error) => VideoResult {
             status: Status::Failed,
@@ -332,7 +417,7 @@ pub fn process_item(item: &InputItem, ctx: &Context) -> VideoResult {
             seconds: 0.0,
             timings: vec![],
         },
-        None => process_video(&item.path, ctx),
+        None => process_video(&item.path, out, ctx),
     }
 }
 
@@ -348,6 +433,8 @@ pub fn process_in_order(
     mut before: impl FnMut(usize),
     mut report: impl FnMut(usize, VideoResult),
 ) -> usize {
+    let outputs = output_paths(items, ctx.settings);
+    let outputs = &outputs;
     // (시작한 영상 수, 더 시작하지 않음)
     let claim = Mutex::new((0usize, false));
     let lock = || claim.lock().unwrap_or_else(|e| e.into_inner());
@@ -366,7 +453,10 @@ pub fn process_in_order(
             let tx = tx.clone();
             scope.spawn(move || {
                 while let Some(i) = take() {
-                    if tx.send((i, process_item(&items[i], ctx))).is_err() {
+                    if tx
+                        .send((i, process_item(&items[i], &outputs[i], ctx)))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -467,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn output_paths() {
+    fn output_path_rules() {
         let video = PathBuf::from("D:/영상/예시 영상.mp4");
         assert_eq!(
             output_path(&video, &Settings::default()),
@@ -486,6 +576,81 @@ mod tests {
     }
 
     #[test]
+    fn numbered_sheets_are_sheets() {
+        for name in [
+            "a_sheet.webp",
+            "a_sheet(2).webp",
+            "A_SHEET(12).JPG",
+            "a (1)_sheet(3).png",
+        ] {
+            assert!(is_sheet(Path::new(name), "_sheet"), "{name}");
+        }
+        for name in [
+            "a_sheet().webp",
+            "a_sheet(x).webp",
+            "a(2).webp",
+            "a_sheet(2).mp4",
+        ] {
+            assert!(!is_sheet(Path::new(name), "_sheet"), "{name}");
+        }
+    }
+
+    #[test]
+    fn same_name_videos_get_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["a.mp4", "a.mkv", "A.mov", "b.mp4", "a_sheet(2).webp"] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+        std::fs::create_dir(root.join("하위")).unwrap();
+        std::fs::write(root.join("하위").join("b.mp4"), b"").unwrap();
+        let item = |p: PathBuf| InputItem {
+            path: p,
+            error: None,
+        };
+        let s = Settings::default();
+        let file_names = |paths: Vec<PathBuf>| -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // 자연 정렬(a.mkv < A.mov < a.mp4) 순으로 번호. b는 겹치지 않는다
+        let items = collect_inputs(&[root.to_path_buf()], false, "_sheet");
+        assert_eq!(
+            file_names(output_paths(&items, &s)),
+            [
+                "a_sheet.webp",
+                "A_sheet(2).webp",
+                "a_sheet(3).webp",
+                "b_sheet.webp"
+            ]
+        );
+        // 하나만 넣어도 같은 폴더의 같은 이름 영상을 순서에 넣어 이름이 같다
+        let only = [item(root.join("a.mp4"))];
+        assert_eq!(file_names(output_paths(&only, &s)), ["a_sheet(3).webp"]);
+
+        // output_dir이 절대 경로면 다른 폴더의 같은 이름도 겹친다 (넣은 것끼리)
+        let out_dir = root.join("모음");
+        let s = Settings {
+            output_dir: out_dir.to_string_lossy().into_owned(),
+            ..Settings::default()
+        };
+        let both = [
+            item(root.join("b.mp4")),
+            item(root.join("하위").join("b.mp4")),
+        ];
+        assert_eq!(
+            output_paths(&both, &s),
+            [
+                out_dir.join("b_sheet.webp"),
+                out_dir.join("b_sheet(2).webp")
+            ]
+        );
+    }
+
+    #[test]
     fn process_done_skip_overwrite_fail() {
         let dir = tempfile::tempdir().unwrap();
         let fonts = find_fonts("");
@@ -497,15 +662,16 @@ mod tests {
             fonts: &fonts,
             cell_workers: 4,
         };
+        let run = |v: &Path| process_video(v, &output_path(v, &settings), &ctx);
 
-        let r = process_video(&video, &ctx);
+        let r = run(&video);
         assert_eq!(r.status, Status::Done, "{}", r.message);
         let out = r.output.unwrap();
         assert_eq!(out, dir.path().join("한글 영상 (1)&_sheet.webp"));
         let names: Vec<&str> = r.timings.iter().map(|t| t.0).collect();
         assert_eq!(names, ["probe", "extract", "render", "save"]);
 
-        let r = process_video(&video, &ctx);
+        let r = run(&video);
         assert_eq!(
             (r.status, r.message.as_str()),
             (Status::Skipped, "이미 있음")
@@ -513,13 +679,13 @@ mod tests {
 
         let broken = dir.path().join("깨짐.mp4");
         std::fs::copy(media("깨짐.mp4"), &broken).unwrap();
-        let r = process_video(&broken, &ctx);
+        let r = run(&broken);
         assert_eq!(r.status, Status::Failed);
         assert!(r.message.contains("영상을 읽을 수 없음"));
 
         let doc = dir.path().join("메모.txt");
         std::fs::write(&doc, "영상 아님").unwrap();
-        let r = process_video(&doc, &ctx);
+        let r = run(&doc);
         assert_eq!(r.status, Status::Skipped);
         assert!(r.message.starts_with("영상 아님"));
     }

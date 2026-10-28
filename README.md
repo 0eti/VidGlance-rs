@@ -29,6 +29,7 @@ Python 버전의 `config.json`을 `%APPDATA%\VidGlance\`에 복사해도 그대�
 
 - 여러 영상은 3개씩 동시에 처리하고, 결과는 놓은 순서대로 보여 줍니다.
 - 이미 시트가 있는 영상은 건너뜁니다(`overwrite`로 바꿀 수 있음).
+- 같은 폴더에 이름이 같고 확장자만 다른 영상(`a.mkv`, `a.mp4`)이 있으면 이름 순으로 `a_sheet.webp`, `a_sheet(2).webp`…가 됩니다. 다시 실행해도 같은 이름이라 이미 만든 시트는 건너뜁니다.
 - 폴더를 놓으면 그 안의 영상(`mp4 mkv avi mov wmv flv webm m4v ts m2ts mpg mpeg 3gp`)만 처리합니다. 하위 폴더는 `recursive`가 `true`일 때만.
 - exe를 **더블클릭**하면 설정 파일 위치를 알려 줍니다(없으면 만듭니다).
 
@@ -89,7 +90,7 @@ Python 버전의 `config.json`을 `%APPDATA%\VidGlance\`에 복사해도 그대�
 | `timestamp_position` | 칸 안 타임스탬프 위치 | `"bottom-right"` / `"bottom-left"` / `"top-right"` / `"top-left"` / `"center"` |
 | `recursive` | 폴더를 놓았을 때 하위 폴더까지 | `true` / `false` |
 | `skip_start_seconds`, `skip_end_seconds` | 앞·뒤에서 뺄 구간(초) | 0 이상 |
-| `seek_mode` | `fast`는 균등 시점에서 가장 가까운 키프레임(빠름, 오차 보통 1~3초), `accurate`는 정확한 시점(느림). 타임스탬프는 항상 실제 장면 시각 | `"fast"` / `"accurate"` |
+| `seek_mode` | `fast`는 균등 시점에서 가장 가까운 키프레임(빠름, 오차 보통 1~3초). 키프레임이 칸 간격의 절반이나 10초보다 멀면 그 칸만 정확한 시점으로 뽑습니다. `accurate`는 항상 정확한 시점(느림). 타임스탬프는 항상 실제 장면 시각 | `"fast"` / `"accurate"` |
 | `font` | 글꼴 파일 경로. 비우면 맑은 고딕 → 내장 Pretendard | 경로 |
 | `close_delay_seconds` | 모두 성공했을 때 창이 닫히기까지 초. 0이면 바로, 음수면 항상 키 대기 | 정수 |
 
