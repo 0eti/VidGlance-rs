@@ -17,6 +17,16 @@ const REOPEN_LIMIT_SECONDS: f64 = 0.1;
 pub const MIN_SPACING: f64 = 0.1;
 /// 프레임 시각 비교 허용 오차(초, 부동소수 오차용)
 const EPSILON: f64 = 1e-3;
+/// fast 모드에서 요청 시각과 키프레임이 이보다 멀면(초) 정확한 시점으로 뽑는다.
+const MAX_KEYFRAME_OFFSET: f64 = 10.0;
+
+/// fast 모드 허용 오차: 칸 간격의 절반과 10초 중 작은 값 (칸이 하나면 정확하게).
+fn fast_tolerance(times: &[f64]) -> f64 {
+    match times {
+        [first, second, ..] => ((second - first) / 2.0).min(MAX_KEYFRAME_OFFSET),
+        _ => 0.0,
+    }
+}
 
 /// 뽑을 시점 목록. 영상이 매우 짧으면 칸 수보다 적다.
 #[derive(Debug, Clone, PartialEq)]
@@ -358,7 +368,7 @@ impl Decoding {
     }
 
     /// seek_mode에 맞게 target(절대 시각)의 프레임을 고른다.
-    /// fast: 가장 가까운 키프레임이 tolerance(칸 간격의 절반) 안이면 그 한 장만 저지연 디코더로
+    /// fast: 가장 가까운 키프레임이 tolerance(칸 간격의 절반, 최대 10초) 안이면 그 한 장만 저지연 디코더로
     /// 디코딩하고, 더 멀면 정확하게.
     fn grab(
         &mut self,
@@ -506,12 +516,7 @@ fn extract_with(
         }
     };
     let start = first.start_time();
-    // fast 모드 허용 오차: 칸 간격의 절반 (칸이 하나면 정확하게)
-    let tolerance = if times.len() > 1 {
-        (times[1] - times[0]) / 2.0
-    } else {
-        0.0
-    };
+    let tolerance = fast_tolerance(times);
 
     let mut slots: Vec<Option<Frame>> = vec![None; times.len()];
     let Some(&t0) = times.first() else {
@@ -691,6 +696,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fast_tolerance_is_half_spacing_capped_at_10s() {
+        // 60초 영상 20칸: 간격 약 2.86초 → 절반 약 1.43초
+        assert!(approx(
+            fast_tolerance(&plan_times(60.0, 20, 0.0, 0.0).times),
+            60.0 / 21.0 / 2.0
+        ));
+        // 3시간 27분 영상 20칸: 간격 약 593초 → 절반 약 296초지만 10초로 제한
+        assert_eq!(
+            fast_tolerance(&plan_times(12452.3, 20, 0.0, 0.0).times),
+            10.0
+        );
+        assert_eq!(fast_tolerance(&[5.0]), 0.0);
     }
 
     #[test]
