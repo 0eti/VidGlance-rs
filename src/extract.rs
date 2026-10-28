@@ -28,6 +28,13 @@ fn fast_tolerance(times: &[f64]) -> f64 {
     }
 }
 
+/// 프레임 시각 t(초)를 파일 시작 시각 기준으로. start는 마이크로초로 반올림된 값이라(TS 1.466667 =
+/// 실제 1.4666…) 그대로 빼면 정확히 10초인 프레임이 9.9999997초가 되어 `00:00:09`로 내림된다.
+/// start보다 정밀할 수 없으므로 마이크로초로 반올림한다.
+fn since_start(t: f64, start: f64) -> f64 {
+    ((t - start) * 1e6).round() / 1e6
+}
+
 /// 뽑을 시점 목록. 영상이 매우 짧으면 칸 수보다 적다.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FramePlan {
@@ -406,7 +413,7 @@ impl Decoding {
         }
         match got.and_then(|(frame, ft)| Some((self.frame_image(&frame, size)?, ft))) {
             Some((image, ft)) => Frame {
-                time: ft - start,
+                time: since_start(ft, start),
                 image: Some(image),
             },
             None => Frame {
@@ -705,6 +712,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn frame_time_survives_rounded_start() {
+        // MPEG-TS: 시작 1.4666…초(90kHz 132000)가 format start_time에는 1466667µs로 저장된다
+        let time_base = 1.0 / 90000.0;
+        let start = 1_466_667.0 / ffi::AV_TIME_BASE as f64;
+        let frame_at_10s = 1_032_000.0 * time_base; // 132000 + 900000
+        assert_eq!(format_duration(frame_at_10s - start), "00:00:09"); // 고치기 전
+        assert_eq!(
+            format_duration(since_start(frame_at_10s, start)),
+            "00:00:10"
+        );
+        assert_eq!(since_start(12.5, 0.0), 12.5);
     }
 
     #[test]
