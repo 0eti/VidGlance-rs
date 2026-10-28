@@ -171,7 +171,7 @@ fn open_decoder(
 impl Decoding {
     fn open(path: &Path, threads: usize) -> Result<Self, ffmpeg::Error> {
         probe::init();
-        Self::from_input(ffmpeg::format::input(path)?, threads, Some(path))
+        Self::from_input(probe::open_input(path)?, threads, Some(path))
     }
 
     /// 이미 연 파일로 시작한다 (probe::open이 연 것을 그대로 쓴다).
@@ -313,7 +313,7 @@ impl Decoding {
         if self.peeker.is_none()
             && let Some(path) = self.reopen.take()
         {
-            self.peeker = ffmpeg::format::input(&path).ok();
+            self.peeker = probe::open_input(&path).ok();
             if self.peeker.is_some() {
                 self.reopen = Some(path);
             }

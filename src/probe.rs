@@ -51,6 +51,76 @@ pub fn init() {
     });
 }
 
+/// 파일 읽기 버퍼(바이트). 색인 없는 fragmented MP4는 조각마다 seek하므로 작을수록 덜 읽는다
+/// (reference2 열기: 32KB 0.43초, 4KB 0.36초).
+const IO_BUFFER_SIZE: usize = 4096;
+
+/// 위치와 크기를 직접 기억하는 파일. FFmpeg는 상자마다 파일 크기·위치를 묻고 seek하는데,
+/// 실제 이동은 다음 read 직전에 한 번만 한다 (조각 13,439개 파일에서 시스템 호출을 크게 줄임).
+struct LazySeekFile {
+    file: std::fs::File,
+    size: u64,
+    pos: u64,  // FFmpeg가 보는 위치
+    real: u64, // 파일 핸들의 실제 위치
+}
+
+impl LazySeekFile {
+    fn new(file: std::fs::File) -> std::io::Result<Self> {
+        let size = file.metadata()?.len();
+        Ok(LazySeekFile {
+            file,
+            size,
+            pos: 0,
+            real: 0,
+        })
+    }
+}
+
+impl std::io::Read for LazySeekFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Seek;
+        if self.real != self.pos {
+            self.file.seek(std::io::SeekFrom::Start(self.pos))?;
+            self.real = self.pos;
+        }
+        let n = self.file.read(buf)?;
+        self.pos += n as u64;
+        self.real = self.pos;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for LazySeekFile {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            std::io::SeekFrom::Start(p) => Some(p),
+            std::io::SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            std::io::SeekFrom::End(d) => self.size.checked_add_signed(d),
+        };
+        self.pos = target.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        Ok(self.pos)
+    }
+}
+
+/// 영상 파일을 연다 (avformat_open_input + find_stream_info, ffmpeg::format::input과 같음).
+///
+/// 파일 바이트는 FFmpeg 기본 파일 읽기 대신 Rust 파일 읽기로 넘긴다. 분석은 FFmpeg가 그대로
+/// 하므로 결과는 같고, Windows에서 조각 많은 MP4를 열 때 훨씬 빠르다 (reference2 1.40초 → 0.36초).
+pub fn open_input(path: &Path) -> Result<ffmpeg::format::context::Input, ffmpeg::Error> {
+    init();
+    let file = std::fs::File::open(path).map_err(|e| ffmpeg::Error::Other {
+        errno: match e.kind() {
+            std::io::ErrorKind::NotFound => ffi::ENOENT,
+            std::io::ErrorKind::PermissionDenied => ffi::EACCES,
+            _ => ffi::EIO,
+        },
+    })?;
+    let file = LazySeekFile::new(file).map_err(|_| ffmpeg::Error::Other { errno: ffi::EIO })?;
+    let io = ffmpeg::format::context::StreamIo::from_read_seek_with_capacity(file, IO_BUFFER_SIZE)?;
+    // 이름은 형식 판별(확장자)에 쓰인다: 기본 열기에 넘기던 경로 그대로
+    ffmpeg::format::input_from_stream(io, Some(&path.to_string_lossy()), None)
+}
+
 /// -v 출력용: FFmpeg 라이브러리 버전과 구성
 pub fn backend_version() -> String {
     let v = unsafe { ffi::avformat_version() };
@@ -132,14 +202,12 @@ pub fn probe(path: &Path) -> Result<VideoInfo, ProbeError> {
 }
 
 /// 영상을 열어 정보를 읽고, 연 파일도 함께 돌려준다 (추출에서 다시 열지 않도록).
-/// 인덱스 없는 fragmented MP4는 열 때마다 조각 헤더 전체를 훑어 1초 넘게 걸린다.
+/// 인덱스 없는 fragmented MP4는 열 때마다 조각 헤더 전체를 훑는다 (reference2 약 0.4초).
 pub fn open(path: &Path) -> Result<(VideoInfo, ffmpeg::format::context::Input), ProbeError> {
-    init();
     let size_bytes = std::fs::metadata(path)
         .map(|m| m.len())
         .map_err(|e| ProbeError(format!("영상을 읽을 수 없음: {e}")))?;
-    let input =
-        ffmpeg::format::input(path).map_err(|e| ProbeError(format!("영상을 읽을 수 없음: {e}")))?;
+    let input = open_input(path).map_err(|e| ProbeError(format!("영상을 읽을 수 없음: {e}")))?;
     let info = read_info(path, size_bytes, &input)?;
     Ok((info, input))
 }
@@ -221,6 +289,44 @@ mod tests {
     use crate::config::{HeaderSettings, Language};
     use crate::formatting::header_lines;
     use crate::test_media::media;
+
+    #[test]
+    fn rust_file_reading_matches_ffmpeg_file_reading() {
+        // 같은 파일을 FFmpeg 기본 파일 읽기로 연 결과와 정보·시작 시각·스트림 길이가 같아야 한다
+        for name in [
+            "기본_1080p30.mp4",
+            "세로_720x1280.mp4",
+            "회전90.mp4",
+            "애너모픽.mp4",
+            "조각난.mp4",
+            "짧음_1초.mp4",
+            "가변프레임.mkv",
+            "무음.mp4",
+            "공백 과 특수문자 (1)&.mp4",
+        ] {
+            let path = media(name);
+            let size = std::fs::metadata(&path).unwrap().len();
+            let ours = open_input(&path).unwrap();
+            let theirs = ffmpeg::format::input(&path).unwrap();
+            assert_eq!(
+                read_info(&path, size, &ours),
+                read_info(&path, size, &theirs),
+                "{name}"
+            );
+            let timing = |i: &ffmpeg::format::context::Input| {
+                let start = unsafe { (*i.as_ptr()).start_time };
+                let streams: Vec<_> = i
+                    .streams()
+                    .map(|s| (s.start_time(), s.duration(), s.avg_frame_rate(), s.rate()))
+                    .collect();
+                (start, i.duration(), streams)
+            };
+            assert_eq!(timing(&ours), timing(&theirs), "{name}");
+        }
+        assert!(open_input(&media("깨짐.mp4")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open_input(&dir.path().join("없는 파일.mp4")).is_err());
+    }
 
     #[test]
     fn fourcc() {
