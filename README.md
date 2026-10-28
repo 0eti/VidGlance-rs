@@ -14,7 +14,7 @@ VidGlance가 지키는 세 가지:
 
 ## Python 버전과 다른 점
 
-| | Python 0.1.1 | Rust 0.2.2 |
+| | Python 0.1.1 | Rust 0.2.3 |
 |---|---|---|
 | 배포 | onefile 82MB 또는 onedir 폴더 210MB | **exe 하나 24MB** (FFmpeg·dav1d·폰트 포함, 다른 DLL 필요 없음) |
 | 시작 | onefile 약 4~5초, onedir 0.3초 | **0.02초** |
