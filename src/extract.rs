@@ -492,6 +492,19 @@ fn decoder_threads(workers: usize) -> usize {
     (cores / workers).max(1)
 }
 
+/// 첫 칸을 뽑은 뒤 나머지 칸을 나눠 뽑을 스레드 수 (1이면 나누지 않음).
+///
+/// 첫 칸을 키프레임 한 장으로 끝냈을 때만 나눈다. 정확한 시점까지 디코딩하는 영상은 디코더가
+/// 이미 코어를 다 쓰고, 혼자 이어서 디코딩하는 편이 빠르다 (측정). 남은 칸보다 많이 나누지 않는다.
+fn split_workers(requested: usize, cells: usize, first_was_keyframe: bool) -> usize {
+    let rest = cells.saturating_sub(1);
+    if first_was_keyframe && rest > 0 {
+        requested.clamp(1, rest)
+    } else {
+        1
+    }
+}
+
 fn extract_with(
     opened: Result<Decoding, ffmpeg::Error>,
     path: &Path,
@@ -526,13 +539,7 @@ fn extract_with(
         };
     };
     slots[0] = Some(first.cell(t0, start, mode, tolerance, size));
-    // 첫 칸을 키프레임 한 장으로 끝냈을 때만 나머지 칸을 나눈다. 정확한 시점까지 디코딩하는
-    // 영상은 디코더가 이미 코어를 다 쓰고, 혼자 이어서 디코딩하는 편이 빠르다 (측정).
-    let workers = if first.keyframe_hits > 0 {
-        workers.clamp(1, times.len() - 1)
-    } else {
-        1
-    };
+    let workers = split_workers(workers, times.len(), first.keyframe_hits > 0);
     let threads = decoder_threads(workers);
     // 스레드마다 이어진 칸 묶음을 맡는다 (같은 키프레임 구간의 칸은 이어서 디코딩하도록)
     let rest = times.len() - 1;
@@ -727,6 +734,16 @@ mod tests {
                 f.time
             );
         }
+    }
+
+    #[test]
+    fn split_workers_never_exceeds_remaining_cells() {
+        assert_eq!(split_workers(4, 20, true), 4);
+        assert_eq!(split_workers(4, 3, true), 2);
+        assert_eq!(split_workers(4, 20, false), 1);
+        // 칸이 하나뿐이면 나눌 칸이 없다 (clamp(1, 0)으로 panic하던 경우)
+        assert_eq!(split_workers(4, 1, true), 1);
+        assert_eq!(split_workers(0, 20, true), 1);
     }
 
     #[test]
