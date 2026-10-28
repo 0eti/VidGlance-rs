@@ -427,6 +427,27 @@ pub fn process_item(item: &InputItem, out: &Path, ctx: &Context) -> VideoResult 
     }
 }
 
+/// 영상 하나를 처리하다 panic이 나도 그 영상만 실패로 돌려준다 (Python의 "예기치 않은 오류"와 같게).
+/// 막지 않으면 동시 처리 스레드가 함께 끝나 요약도 키 대기도 없이 창이 닫힌다.
+fn guarded(work: impl FnOnce() -> VideoResult) -> VideoResult {
+    let began = Instant::now();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+        let reason = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "알 수 없는 오류".into());
+        VideoResult {
+            status: Status::Failed,
+            message: format!("예기치 않은 오류: {reason}"),
+            output: None,
+            warnings: vec![],
+            seconds: began.elapsed().as_secs_f64(),
+            timings: vec![],
+        }
+    })
+}
+
 /// 영상들을 jobs개 스레드로 동시에 처리하고, 결과는 입력 순서대로 report에 넘긴다.
 ///
 /// before(i)는 i번째 결과를 기다리기 전에 불린다 (진행 표시용). stop()이 true가 되면 새 영상은
@@ -459,10 +480,8 @@ pub fn process_in_order(
             let tx = tx.clone();
             scope.spawn(move || {
                 while let Some(i) = take() {
-                    if tx
-                        .send((i, process_item(&items[i], &outputs[i], ctx)))
-                        .is_err()
-                    {
+                    let result = guarded(|| process_item(&items[i], &outputs[i], ctx));
+                    if tx.send((i, result)).is_err() {
                         return;
                     }
                 }

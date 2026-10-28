@@ -323,9 +323,11 @@ fn encode(image: &RgbImage, format: OutputFormat, quality: i64) -> std::io::Resu
     let mut out = Vec::new();
     match format {
         OutputFormat::Webp => {
-            out.extend_from_slice(
-                &webp::Encoder::from_rgb(image.as_raw(), w, h).encode(quality as f32),
-            );
+            // encode()는 실패하면 panic하므로 에러를 돌려주는 encode_simple을 쓴다
+            let encoded = webp::Encoder::from_rgb(image.as_raw(), w, h)
+                .encode_simple(false, quality as f32)
+                .map_err(|e| std::io::Error::other(format!("WebP 인코딩 실패: {e:?}")))?;
+            out.extend_from_slice(&encoded);
         }
         OutputFormat::Jpg => {
             image::codecs::jpeg::JpegEncoder::new_with_quality(
